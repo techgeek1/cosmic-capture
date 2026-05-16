@@ -42,10 +42,17 @@ use crate::cli::{CommonArgs, GifArgs, RecordArgs, VideoContainer, VideoEncoder};
 use crate::encode::video::CropRect;
 use crate::pipeline;
 
-use super::widget::{DragKind, RectMode, RectangleSelection, SelectionRect};
+use super::widget::{
+    DragSession, RectMode, RectangleSelection, SelectionEvent, SelectionRect,
+};
 
 const APP_ID: &str = "com.system76.CosmicCapture";
 const TOOLBAR_BOTTOM_MARGIN: u16 = 32;
+/// Shared id for the synthetic DnD operation our selection widgets use to
+/// track cursor motion across per-output layer surfaces. Constant because
+/// only one selection drag exists at a time; collisions with real DnD ops
+/// are avoided by the matching `DND_MIME` filter on incoming events.
+const SELECTION_DND_ID: u128 = 0x4341_5054_5552_452D_5345_4C45_4354_494F;
 
 pub fn launch() -> Result<()> {
     tracing::info!("cosmic-capture GUI starting (layer-shell toolbar)");
@@ -59,13 +66,14 @@ pub fn launch() -> Result<()> {
     result
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
+    #[default]
     Screenshot,
     Record,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum Source {
     #[default]
     Region,
@@ -74,18 +82,20 @@ pub enum Source {
     Screen,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum SaveTarget {
     #[default]
+    Clipboard,
     Pictures,
     Documents,
-    Clipboard,
 }
 
+// Clipboard first — typical screenshot flow is "grab and paste somewhere",
+// so we put it at the top of the dropdown and make it the default.
 const SAVE_TARGETS: [SaveTarget; 3] = [
+    SaveTarget::Clipboard,
     SaveTarget::Pictures,
     SaveTarget::Documents,
-    SaveTarget::Clipboard,
 ];
 
 fn save_target_labels() -> Vec<String> {
@@ -100,7 +110,7 @@ fn save_target_labels() -> Vec<String> {
         .collect()
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum RecordFormat {
     #[default]
     Mp4,
@@ -129,6 +139,38 @@ fn record_format_labels() -> Vec<String> {
         .collect()
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum RecordFps {
+    Fps24,
+    #[default]
+    Fps30,
+    Fps60,
+}
+
+const RECORD_FPS: [RecordFps; 3] = [RecordFps::Fps24, RecordFps::Fps30, RecordFps::Fps60];
+
+fn record_fps_labels() -> Vec<String> {
+    RECORD_FPS
+        .iter()
+        .map(|f| match f {
+            RecordFps::Fps24 => "24 FPS",
+            RecordFps::Fps30 => "30 FPS",
+            RecordFps::Fps60 => "60 FPS",
+        }
+        .to_string())
+        .collect()
+}
+
+impl RecordFps {
+    pub fn as_u32(self) -> u32 {
+        match self {
+            RecordFps::Fps24 => 24,
+            RecordFps::Fps30 => 30,
+            RecordFps::Fps60 => 60,
+        }
+    }
+}
+
 #[derive(Default, Debug)]
 enum CaptureState {
     #[default]
@@ -146,18 +188,27 @@ struct OutputInfo {
     logical_pos: (i32, i32),
     logical_size: (u32, u32),
     scale: i32,
-    layer_id: Option<window::Id>,
+    /// Per-output toolbar layer surface (the pill + selection canvas).
+    /// One per output so users can capture from whichever monitor they like.
+    toolbar_id: Option<window::Id>,
+    /// Pointer-transparent recording-border surface, opened only while
+    /// recording is in progress.
+    recording_id: Option<window::Id>,
 }
 
 pub struct Panel {
     core: Core,
-    toolbar_id: window::Id,
+    /// cosmic-config handle used to persist setting changes. None means
+    /// cosmic-config init failed at startup — runtime mutations still work,
+    /// they just don't survive a restart.
+    config: Option<cosmic_config::Config>,
+
     mode: Mode,
     source: Source,
     save_target: SaveTarget,
     record_format: RecordFormat,
+    record_fps: RecordFps,
 
-    rec_fps: u32,
     rec_encoder: VideoEncoder,
     rec_audio: bool,
     rec_cursor: bool,
@@ -167,6 +218,10 @@ pub struct Panel {
 
     outputs: HashMap<u32, OutputInfo>,
     region: Option<SelectionRect>,
+    /// Active drag session lifted out of the widget so every per-output
+    /// instance computes new rect coords from the same anchor + start_rect.
+    /// `Some` only while the user is actively dragging.
+    drag: Option<DragSession>,
     capture: CaptureState,
 }
 
@@ -176,9 +231,10 @@ pub enum Msg {
     SetSource(Source),
     SetSaveTarget(usize),
     SetRecordFormat(usize),
+    SetRecordFps(usize),
 
     SelectRegion,
-    RegionChanged(SelectionRect, DragKind),
+    Selection(SelectionEvent),
     CancelSelection,
     EscPressed,
 
@@ -207,78 +263,70 @@ impl Application for Panel {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
-        let toolbar_id = window::Id::unique();
+        let (settings, config) = super::config::UserSettings::load();
         let panel = Self {
             core,
-            toolbar_id,
-            mode: Mode::Record,
-            source: Source::Region,
-            save_target: SaveTarget::default(),
-            record_format: RecordFormat::default(),
-            rec_fps: 60,
+            config,
+            mode: settings.mode,
+            source: settings.source,
+            save_target: settings.save_target,
+            record_format: settings.record_format,
+            record_fps: settings.record_fps,
             rec_encoder: VideoEncoder::Auto,
             rec_audio: false,
             rec_cursor: true,
             notify: true,
             clipboard: false,
             outputs: HashMap::new(),
-            region: None,
+            region: settings.last_region,
+            drag: None,
             capture: CaptureState::default(),
         };
 
-        // Toolbar is a fullscreen layer surface with the pill aligned to the
-        // bottom. Why fullscreen instead of a small bottom-anchored surface:
-        //
-        //  * Click capture — input_zone is None, so clicks outside the pill
-        //    are absorbed by the (transparent) surface instead of leaking to
-        //    apps underneath. Matches cosmic-screenshot's modal feel.
-        //  * Popups — popup_dropdown spawns its menu as an xdg-popup parented
-        //    to the toolbar. The popup needs room to render above the pill;
-        //    if the parent surface is only the pill's height, the popup
-        //    geometry extends outside the parent and cosmic-comp drops
-        //    pointer events on it.
-        //
-        // Keyboard starts Exclusive so popup selections don't bounce focus
-        // to other apps. We drop to None on recording start (see
-        // on_primary_action).
-        let open_toolbar = get_layer_surface(SctkLayerSurfaceSettings {
-            id: toolbar_id,
-            layer: Layer::Overlay,
-            keyboard_interactivity: KeyboardInteractivity::Exclusive,
-            input_zone: None,
-            anchor: Anchor::all(),
-            output: IcedOutput::Active,
-            namespace: "cosmic-capture-toolbar".to_string(),
-            size: Some((None, None)),
-            exclusive_zone: -1,
-            size_limits: Limits::NONE.min_height(1.0).min_width(1.0),
-            margin: IcedMargin::default(),
-        });
-
-        (panel, open_toolbar)
+        // No toolbar surface yet — we wait for OutputEvent::Created and open
+        // one per output so users can capture from any monitor regardless of
+        // which one they were focused on when launching. See
+        // `ensure_toolbar_for_output`.
+        (panel, Task::none())
     }
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
         match msg {
             Msg::SetMode(m) => {
-                if !self.locked() {
+                if !self.locked() && self.mode != m {
                     self.mode = m;
+                    self.persist(|s, c| s.set_mode(c, m));
                 }
             }
             Msg::SetSource(s) => {
-                if !self.locked() {
+                if !self.locked() && self.source != s {
                     self.source = s;
+                    self.persist(|st, c| st.set_source(c, s));
                 }
             }
             Msg::ToggleClipboard => self.clipboard = !self.clipboard,
             Msg::SetSaveTarget(i) => {
                 if let Some(&t) = SAVE_TARGETS.get(i) {
-                    self.save_target = t;
+                    if self.save_target != t {
+                        self.save_target = t;
+                        self.persist(|s, c| s.set_save_target(c, t));
+                    }
                 }
             }
             Msg::SetRecordFormat(i) => {
                 if let Some(&f) = RECORD_FORMATS.get(i) {
-                    self.record_format = f;
+                    if self.record_format != f {
+                        self.record_format = f;
+                        self.persist(|s, c| s.set_record_format(c, f));
+                    }
+                }
+            }
+            Msg::SetRecordFps(i) => {
+                if let Some(&f) = RECORD_FPS.get(i) {
+                    if self.record_fps != f {
+                        self.record_fps = f;
+                        self.persist(|s, c| s.set_record_fps(c, f));
+                    }
                 }
             }
 
@@ -302,9 +350,16 @@ impl Application for Panel {
                                 logical_pos,
                                 logical_size,
                                 scale,
-                                layer_id: None,
+                                toolbar_id: None,
+                                recording_id: None,
                             },
                         );
+                        // First time we have any geometry, validate the
+                        // persisted region — if the monitor it lived on is
+                        // gone, drop it so the user doesn't see a phantom
+                        // rect pointing into empty space.
+                        self.prune_stale_region();
+                        return self.ensure_toolbar_for(key);
                     }
                     OutputEvent::Created(None) => {}
                     OutputEvent::InfoUpdate(info) => {
@@ -320,35 +375,53 @@ impl Application for Panel {
                             }
                             o.scale = info.scale_factor;
                         }
+                        // If we'd missed opening a toolbar (e.g. the Created
+                        // event arrived without geometry), retry now.
+                        return self.ensure_toolbar_for(key);
                     }
                     OutputEvent::Removed => {
                         if let Some(info) = self.outputs.remove(&key) {
-                            if let Some(id) = info.layer_id {
-                                return destroy_layer_surface(id);
+                            let mut tasks: Vec<Task<Msg>> = Vec::new();
+                            if let Some(id) = info.toolbar_id {
+                                tasks.push(destroy_layer_surface(id));
                             }
+                            if let Some(id) = info.recording_id {
+                                tasks.push(destroy_layer_surface(id));
+                            }
+                            return Task::batch(tasks);
                         }
                     }
                 }
             }
 
             Msg::SelectRegion => {
-                // Legacy message kept for the keyboard-wrapper code paths; in
-                // the stacked architecture the selector is always live in
-                // Region mode, so this is a no-op.
+                // Legacy no-op — selector is always live in Region mode.
             }
-            Msg::RegionChanged(rect, kind) => {
-                let n = rect.normalize();
-                tracing::trace!(?kind, w = n.width(), h = n.height(), "region updated");
+            Msg::Selection(SelectionEvent::DragStart {
+                session,
+                initial_rect,
+            }) => {
+                tracing::trace!(?session, "drag started");
+                self.drag = Some(session);
+                self.region = Some(initial_rect);
+                // Don't persist mid-drag — wait for DragEnd.
+            }
+            Msg::Selection(SelectionEvent::DragMove(rect)) => {
                 self.region = Some(rect);
-                let _ = kind;
-                // Selector stays open at all times so the user can keep
-                // resizing via the corner / edge handles. Recording, Esc, or
-                // ✕ closes it.
+            }
+            Msg::Selection(SelectionEvent::DragEnd) => {
+                tracing::trace!("drag ended");
+                self.drag = None;
+                // Persist the final rect now that the user has released.
+                if let Some(r) = self.region {
+                    self.persist(|s, c| s.set_last_region(c, Some(r)));
+                }
             }
             Msg::CancelSelection => {
                 tracing::info!("selection cancelled");
                 self.region = None;
-                return self.close_selector_surfaces();
+                self.drag = None;
+                self.persist(|s, c| s.set_last_region(c, None));
             }
 
             Msg::PrimaryAction => {
@@ -363,10 +436,8 @@ impl Application for Panel {
                     self.capture = CaptureState::Saving;
                 }
                 CaptureState::Idle => {
-                    let any_open = self.outputs.values().any(|o| o.layer_id.is_some());
-                    if any_open {
-                        return self.close_selector_surfaces();
-                    }
+                    // Not recording → Esc exits the application entirely.
+                    return self.shutdown();
                 }
                 _ => {}
             },
@@ -379,15 +450,11 @@ impl Application for Panel {
                 } else if let Ok(p) = &r {
                     tracing::info!(path = %p, "capture pipeline finished");
                 }
-                let close_selector = self.close_selector_surfaces();
-                let close_toolbar = destroy_layer_surface(self.toolbar_id);
-                return Task::batch([close_selector, close_toolbar, iced::exit()]);
+                return self.shutdown();
             }
 
             Msg::Quit => {
-                let close_selector = self.close_selector_surfaces();
-                let close_toolbar = destroy_layer_surface(self.toolbar_id);
-                return Task::batch([close_selector, close_toolbar, iced::exit()]);
+                return self.shutdown();
             }
         }
         Task::none()
@@ -403,24 +470,31 @@ impl Application for Panel {
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Msg> {
-        if id == self.toolbar_id {
-            return self.view_toolbar();
+        // Toolbar surface — every output gets its own. The pill renders
+        // identically on each; the selection canvas underneath is scoped to
+        // that output's bounds.
+        if let Some(info) = self.outputs.values().find(|o| o.toolbar_id == Some(id)) {
+            return self.view_toolbar(info);
         }
-        // Per-output recording overlay (input_zone is empty so clicks pass
-        // through to apps). Renders the red border only.
-        let info = self.outputs.values().find(|o| o.layer_id == Some(id));
-        let Some(info) = info else {
-            return iced::widget::Space::new().into();
-        };
-        let output_rect = SelectionRect {
-            left: info.logical_pos.0,
-            top: info.logical_pos.1,
-            right: info.logical_pos.0 + info.logical_size.0 as i32,
-            bottom: info.logical_pos.1 + info.logical_size.1 as i32,
-        };
-        let selection = self.region.unwrap_or_default();
-        RectangleSelection::new(output_rect, selection, RectMode::Recording, Msg::RegionChanged)
-            .into()
+        // Recording overlay — pointer-transparent surface that just paints
+        // the red border around the active capture region. The widget is in
+        // Recording mode so it ignores input; drag/dnd plumbing here is
+        // unused but the API requires it.
+        if let Some(info) = self.outputs.values().find(|o| o.recording_id == Some(id)) {
+            let output_rect = output_rect_of(info);
+            let selection = self.region.unwrap_or_default();
+            return RectangleSelection::new(
+                output_rect,
+                selection,
+                RectMode::Recording,
+                SELECTION_DND_ID,
+                id,
+                None,
+                Msg::Selection,
+            )
+            .into();
+        }
+        iced::widget::Space::new().into()
     }
 
     fn subscription(&self) -> Subscription<Msg> {
@@ -465,27 +539,55 @@ impl Panel {
         }
     }
 
-    fn close_selector_surfaces(&mut self) -> Task<Msg> {
-        let mut tasks: Vec<Task<Msg>> = Vec::new();
-        for info in self.outputs.values_mut() {
-            if let Some(id) = info.layer_id.take() {
-                tasks.push(destroy_layer_surface(id));
-            }
+    /// Open a fullscreen toolbar layer surface anchored to the given output if
+    /// one isn't already open. Each output gets its own surface so users can
+    /// drive capture from whichever monitor they're focused on.
+    ///
+    /// Toolbars start at `KeyboardInteractivity::Exclusive` so iced's dropdown
+    /// overlays receive key events without bouncing focus to apps below.
+    /// Multiple Exclusive layer surfaces are allowed by wlr-layer-shell —
+    /// cosmic-comp routes focus to whichever surface the pointer is over.
+    fn ensure_toolbar_for(&mut self, key: u32) -> Task<Msg> {
+        let Some(info) = self.outputs.get_mut(&key) else {
+            return Task::none();
+        };
+        if info.toolbar_id.is_some() {
+            return Task::none();
         }
-        Task::batch(tasks)
+        // While recording, don't spawn new toolbars for outputs that come
+        // online late — they'd appear over recorded apps.
+        if matches!(self.capture, CaptureState::Recording { .. }) {
+            return Task::none();
+        }
+        let id = window::Id::unique();
+        info.toolbar_id = Some(id);
+        get_layer_surface(SctkLayerSurfaceSettings {
+            id,
+            layer: Layer::Overlay,
+            keyboard_interactivity: KeyboardInteractivity::Exclusive,
+            input_zone: None,
+            anchor: Anchor::all(),
+            output: IcedOutput::Output(info.output.clone()),
+            namespace: "cosmic-capture-toolbar".to_string(),
+            size: Some((None, None)),
+            exclusive_zone: -1,
+            size_limits: Limits::NONE.min_height(1.0).min_width(1.0),
+            margin: IcedMargin::default(),
+        })
     }
 
-    /// Swap the per-output overlays to a pointer-transparent recording layer
-    /// (input_zone is an empty Vec, so all clicks pass through to apps; the
-    /// surface just draws the red border).
+    /// Open pointer-transparent recording-border surfaces on every output.
+    /// These sit at `Layer::Top` (below the toolbar overlays) and just draw
+    /// the red selection rect. Clicks pass through because `input_zone` is an
+    /// empty region.
     fn open_recording_overlays(&mut self) -> Task<Msg> {
         let mut tasks: Vec<Task<Msg>> = Vec::new();
         for info in self.outputs.values_mut() {
-            if let Some(old) = info.layer_id.take() {
+            if let Some(old) = info.recording_id.take() {
                 tasks.push(destroy_layer_surface(old));
             }
             let id = window::Id::unique();
-            info.layer_id = Some(id);
+            info.recording_id = Some(id);
             tasks.push(get_layer_surface(SctkLayerSurfaceSettings {
                 id,
                 layer: Layer::Top,
@@ -501,6 +603,88 @@ impl Panel {
             }));
         }
         Task::batch(tasks)
+    }
+
+    /// Drop keyboard interactivity on every toolbar surface — called when
+    /// recording starts so the user can drive the apps they're capturing.
+    fn release_toolbar_keyboards(&self) -> Task<Msg> {
+        let mut tasks: Vec<Task<Msg>> = Vec::new();
+        for info in self.outputs.values() {
+            if let Some(id) = info.toolbar_id {
+                tasks.push(set_keyboard_interactivity(id, KeyboardInteractivity::None));
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// Destroy every surface we own and exit the iced runtime. Used by both
+    /// the explicit close (`Msg::Quit`, Esc-when-idle) and pipeline-completion
+    /// paths.
+    fn shutdown(&mut self) -> Task<Msg> {
+        let mut tasks: Vec<Task<Msg>> = Vec::new();
+        for info in self.outputs.values_mut() {
+            if let Some(id) = info.toolbar_id.take() {
+                tasks.push(destroy_layer_surface(id));
+            }
+            if let Some(id) = info.recording_id.take() {
+                tasks.push(destroy_layer_surface(id));
+            }
+        }
+        tasks.push(iced::exit());
+        Task::batch(tasks)
+    }
+
+    /// Drop a persisted region if its center doesn't fall inside any current
+    /// output (e.g. the monitor was unplugged between launches). Better to
+    /// start clean than show a rect floating in nothingness.
+    fn prune_stale_region(&mut self) {
+        let Some(region) = self.region else {
+            return;
+        };
+        let region = region.normalize();
+        let cx = (region.left + region.right) / 2;
+        let cy = (region.top + region.bottom) / 2;
+        let on_an_output = self.outputs.values().any(|o| {
+            let r_left = o.logical_pos.0;
+            let r_top = o.logical_pos.1;
+            let r_right = r_left + o.logical_size.0 as i32;
+            let r_bottom = r_top + o.logical_size.1 as i32;
+            cx >= r_left && cx < r_right && cy >= r_top && cy < r_bottom
+        });
+        if !on_an_output {
+            tracing::info!(?region, "saved region is off-screen; clearing");
+            self.region = None;
+            self.persist(|s, c| s.set_last_region(c, None));
+        }
+    }
+
+    /// Helper to wrap a cosmic-config setter call. The closure receives the
+    /// UserSettings struct and Config handle and should call the appropriate
+    /// `set_<field>` method.
+    fn persist<F>(&self, f: F)
+    where
+        F: FnOnce(
+            &mut super::config::UserSettings,
+            &cosmic_config::Config,
+        ) -> Result<bool, cosmic_config::Error>,
+    {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        // Build a snapshot of the current state matching the on-disk schema,
+        // then let the closure perform the targeted set. The derive-generated
+        // set_* methods write to disk only if the value differs.
+        let mut snapshot = super::config::UserSettings {
+            mode: self.mode,
+            source: self.source,
+            save_target: self.save_target,
+            record_format: self.record_format,
+            record_fps: self.record_fps,
+            last_region: self.region,
+        };
+        if let Err(e) = f(&mut snapshot, config) {
+            tracing::warn!(error = %e, "cosmic-config write failed");
+        }
     }
 
     fn crop_from_region(&self) -> Option<CropRect> {
@@ -559,16 +743,12 @@ impl Panel {
                         }
                     };
                     self.capture = CaptureState::Saving;
-                    let close = self.close_selector_surfaces();
                     let notify_user = self.notify;
                     let cursor = self.rec_cursor;
-                    Task::batch([
-                        close,
-                        Task::perform(
-                            run_screenshot(output_name, cursor, crop, destination, notify_user),
-                            |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
-                        ),
-                    ])
+                    Task::perform(
+                        run_screenshot(output_name, cursor, crop, destination, notify_user),
+                        |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+                    )
                 }
                 Mode::Record => {
                     if !self.can_start() {
@@ -579,10 +759,9 @@ impl Panel {
                         Source::Screen | Source::Window => None,
                     };
                     let swap = self.open_recording_overlays();
-                    // Recording → toolbar must stop hogging keyboard so the
+                    // Recording → toolbars must stop hogging keyboard so the
                     // user can drive the apps they're capturing.
-                    let release_kb =
-                        set_keyboard_interactivity(self.toolbar_id, KeyboardInteractivity::None);
+                    let release_kb = self.release_toolbar_keyboards();
                     match self.record_format {
                         RecordFormat::Gif => {
                             let args = self.build_gif_args();
@@ -616,7 +795,7 @@ impl Panel {
         }
     }
 
-    fn view_toolbar(&self) -> Element<'_, Msg> {
+    fn view_toolbar(&self, info: &OutputInfo) -> Element<'_, Msg> {
         // All iconic buttons share `.medium()` sizing for a uniform row.
         // `Button::IconVertical` (as opposed to plain `Button::Icon`) renders
         // a lighter-background overlay on `.selected()`, which is the visible
@@ -704,6 +883,16 @@ impl Panel {
             }
         };
 
+        // FPS selector — record mode only. Standalone dropdown so it's a
+        // single click away from the toolbar, not buried in an options popup.
+        let fps_dropdown: Option<Element<'_, Msg>> = match self.mode {
+            Mode::Record => {
+                let selected = RECORD_FPS.iter().position(|f| *f == self.record_fps);
+                Some(dropdown(record_fps_labels(), selected, Msg::SetRecordFps).into())
+            }
+            Mode::Screenshot => None,
+        };
+
         let close = button::icon(icon::from_name("window-close-symbolic"))
             .medium()
             .on_press(Msg::Quit);
@@ -715,12 +904,16 @@ impl Panel {
                 .height(Length::Fixed(56.0))
         };
 
-        let pill = row::with_capacity(9)
+        let mut pill = row::with_capacity(11)
             .push(modes)
             .push(sep())
             .push(sources)
             .push(sep())
-            .push(action)
+            .push(action);
+        if let Some(fps) = fps_dropdown {
+            pill = pill.push(sep()).push(fps);
+        }
+        let pill = pill
             .push(sep())
             .push(options)
             .push(sep())
@@ -731,15 +924,23 @@ impl Panel {
         // Styled pill background — matches xdg-desktop-portal-cosmic's
         // screenshot toolbar: opaque component bg with small corner radius.
         // Width fixed so the pill stays compact even though it lives inside
-        // a fullscreen surface.
+        // a fullscreen surface. While recording, the pill drops to 30%
+        // opacity so it doesn't dominate the captured frame; the user can
+        // still see it well enough to click Stop.
+        let recording = matches!(self.capture, CaptureState::Recording { .. });
+        let pill_alpha: f32 = if recording { 0.30 } else { 1.0 };
         let styled = container(pill)
             .padding([8, 12, 8, 12])
             .width(Length::Shrink)
-            .class(cosmic::theme::Container::Custom(Box::new(|theme| {
+            .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
                 let t = theme.cosmic();
+                let mut bg: Color = t.background.component.base.into();
+                bg.a *= pill_alpha;
+                let mut fg: Color = t.background.component.on.into();
+                fg.a *= pill_alpha;
                 cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(t.background.component.base.into())),
-                    text_color: Some(t.background.component.on.into()),
+                    background: Some(Background::Color(bg)),
+                    text_color: Some(fg),
                     border: Border {
                         radius: t.corner_radii.radius_s.into(),
                         ..Default::default()
@@ -757,47 +958,39 @@ impl Panel {
             .align_x(iced::Alignment::Center)
             .align_y(iced::Alignment::End);
 
-        // While in Region mode and not recording, render the selection
-        // widget *beneath* the pill in a Stack. iced routes pointer events
-        // top-down — the pill (front) absorbs clicks on its bounds, drags
-        // anywhere else fall through to the selection widget. No need for
-        // separate per-output selector surfaces during the select phase.
-        let in_select_phase = matches!(self.source, Source::Region)
-            && !matches!(
-                self.capture,
-                CaptureState::Recording { .. } | CaptureState::Saving
-            );
-        if in_select_phase {
-            let output_rect = self.active_output_rect();
-            let sel = RectangleSelection::new(
-                output_rect,
-                self.region.unwrap_or_default(),
-                RectMode::Selecting,
-                Msg::RegionChanged,
-            );
-            iced::widget::Stack::new()
-                .push(Element::from(sel))
-                .push(pill_layer)
-                .into()
-        } else {
-            pill_layer.into()
-        }
-    }
+        // Compose extra layers (selection widget, fullscreen border) under
+        // the pill via iced Stack. iced routes pointer events top-down: the
+        // pill (front) absorbs clicks on its bounds, drags anywhere else
+        // fall through to whatever sits below.
+        let pre_capture = !matches!(
+            self.capture,
+            CaptureState::Recording { .. } | CaptureState::Saving
+        );
+        let output_rect = output_rect_of(info);
+        let mut stack = iced::widget::Stack::new();
 
-    fn active_output_rect(&self) -> SelectionRect {
-        // Single-output assumption for now — pick whichever output we have.
-        // Multi-output layout (toolbar on the active one, selection widget
-        // on each) can be layered on later.
-        self.outputs
-            .values()
-            .next()
-            .map(|info| SelectionRect {
-                left: info.logical_pos.0,
-                top: info.logical_pos.1,
-                right: info.logical_pos.0 + info.logical_size.0 as i32,
-                bottom: info.logical_pos.1 + info.logical_size.1 as i32,
-            })
-            .unwrap_or_default()
+        if pre_capture && matches!(self.source, Source::Region) {
+            // view_toolbar is only invoked via the dispatch path that found
+            // this id, so info.toolbar_id must be Some.
+            if let Some(toolbar_id) = info.toolbar_id {
+                let sel = RectangleSelection::new(
+                    output_rect,
+                    self.region.unwrap_or_default(),
+                    RectMode::Selecting,
+                    SELECTION_DND_ID,
+                    toolbar_id,
+                    self.drag,
+                    Msg::Selection,
+                );
+                stack = stack.push(Element::from(sel));
+            }
+        }
+
+        if pre_capture && matches!(self.source, Source::Screen) {
+            stack = stack.push(fullscreen_border());
+        }
+
+        stack.push(pill_layer).into()
     }
 
     fn idle_action_label(&self) -> String {
@@ -819,7 +1012,7 @@ impl Panel {
                 notify: self.notify,
                 clipboard: self.clipboard,
             },
-            fps: self.rec_fps,
+            fps: self.record_fps.as_u32(),
             encoder: self.rec_encoder,
             container,
             audio: self.rec_audio,
@@ -844,11 +1037,64 @@ impl Panel {
         }
     }
     fn active_output_name(&self) -> Option<String> {
-        // Same single-output assumption as `active_output_rect`. When we add
-        // multi-output positioning the toolbar will know which output it's
-        // anchored to and we'll thread that through here.
+        // Multi-output: pick whichever output the region's center sits on,
+        // falling back to the first output if no region (Source::Screen).
+        // This makes "capture this monitor" do the right thing whichever
+        // toolbar the user clicks Capture on.
+        if let Some(region) = self.region {
+            let region = region.normalize();
+            let cx = (region.left + region.right) / 2;
+            let cy = (region.top + region.bottom) / 2;
+            if let Some(info) = self.outputs.values().find(|o| {
+                let r_left = o.logical_pos.0;
+                let r_top = o.logical_pos.1;
+                let r_right = r_left + o.logical_size.0 as i32;
+                let r_bottom = r_top + o.logical_size.1 as i32;
+                cx >= r_left && cx < r_right && cy >= r_top && cy < r_bottom
+            }) {
+                return Some(info.name.clone());
+            }
+        }
         self.outputs.values().next().map(|o| o.name.clone())
     }
+}
+
+fn output_rect_of(info: &OutputInfo) -> SelectionRect {
+    SelectionRect {
+        left: info.logical_pos.0,
+        top: info.logical_pos.1,
+        right: info.logical_pos.0 + info.logical_size.0 as i32,
+        bottom: info.logical_pos.1 + info.logical_size.1 as i32,
+    }
+}
+
+/// Rounded inset border that fills the surface — shown when Source::Screen
+/// is active to signal which display will be captured. Pointer-transparent
+/// (it's just a styled container) so the user can still interact with the
+/// toolbar pill that sits above it in the Stack.
+fn fullscreen_border<'a>() -> Element<'a, Msg> {
+    let border_only = container(iced::widget::Space::new())
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .class(cosmic::theme::Container::Custom(Box::new(|theme| {
+            let t = theme.cosmic();
+            cosmic::iced::widget::container::Style {
+                background: None,
+                border: Border {
+                    radius: t.corner_radii.radius_m.into(),
+                    width: 3.0,
+                    color: t.accent_color().into(),
+                },
+                ..Default::default()
+            }
+        })));
+    // Outer container pads 8px on every side so the border sits visibly
+    // inset from the screen edge rather than clipping against it.
+    container(border_only)
+        .padding(8)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 enum ActionKind {
