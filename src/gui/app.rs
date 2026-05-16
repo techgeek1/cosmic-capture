@@ -138,6 +138,19 @@ fn record_format_labels() -> Vec<String> {
         .collect()
 }
 
+impl RecordFormat {
+    /// The wayland clipboard mime type to advertise when copying a finished
+    /// recording so paste targets get an actual media payload.
+    pub fn mime(self) -> &'static str {
+        match self {
+            RecordFormat::Mp4 => "video/mp4",
+            RecordFormat::Mkv => "video/x-matroska",
+            RecordFormat::WebM => "video/webm",
+            RecordFormat::Gif => "image/gif",
+        }
+    }
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum RecordFps {
     Fps24,
@@ -231,6 +244,9 @@ pub struct Panel {
     /// across its buttons and block clicks to the apps being recorded).
     stop_pill_id: Option<window::Id>,
     capture: CaptureState,
+    /// `Some(Instant)` while a recording is in progress — used to render the
+    /// elapsed-time label on the stop pill. Cleared on shutdown.
+    recording_started_at: Option<std::time::Instant>,
     /// Set true when Esc fires during recording. gst can't abort mid-stream
     /// (the muxer would leave a corrupt file), so we still let it drain;
     /// the *Finished message handler reads this flag and deletes the
@@ -258,6 +274,10 @@ pub enum Msg {
     /// User picked a specific window — pulls the identifier from the toplevel
     /// snapshot and kicks the screenshot pipeline at it.
     CaptureToplevel(String),
+
+    /// Periodic tick during recording, fired by an `iced::time::every`
+    /// subscription so the elapsed-time label on the stop pill keeps moving.
+    Tick,
 
     ToggleClipboard,
 
@@ -304,6 +324,7 @@ impl Application for Panel {
             drag: None,
             stop_pill_id: None,
             capture: CaptureState::default(),
+            recording_started_at: None,
             cancel_pending: false,
         };
 
@@ -319,13 +340,13 @@ impl Application for Panel {
             Msg::SetMode(m) => {
                 if !self.locked() && self.mode != m {
                     self.mode = m;
-                    self.persist(|s, c| s.set_mode(c, m));
+                    self.persist("mode", &m);
                 }
             }
             Msg::SetSource(s) => {
                 if !self.locked() && self.source != s {
                     self.source = s;
-                    self.persist(|st, c| st.set_source(c, s));
+                    self.persist("source", &s);
                     if matches!(s, Source::Window) {
                         // Kick off a fresh toplevel enumeration.
                         return Task::perform(load_toplevels(), |list| {
@@ -339,7 +360,7 @@ impl Application for Panel {
                 if let Some(&t) = SAVE_TARGETS.get(i) {
                     if self.save_target != t {
                         self.save_target = t;
-                        self.persist(|s, c| s.set_save_target(c, t));
+                        self.persist("save_target", &t);
                     }
                 }
             }
@@ -347,7 +368,7 @@ impl Application for Panel {
                 if let Some(&f) = RECORD_FORMATS.get(i) {
                     if self.record_format != f {
                         self.record_format = f;
-                        self.persist(|s, c| s.set_record_format(c, f));
+                        self.persist("record_format", &f);
                     }
                 }
             }
@@ -355,7 +376,7 @@ impl Application for Panel {
                 if let Some(&f) = RECORD_FPS.get(i) {
                     if self.record_fps != f {
                         self.record_fps = f;
-                        self.persist(|s, c| s.set_record_fps(c, f));
+                        self.persist("record_fps", &f);
                     }
                 }
             }
@@ -444,19 +465,23 @@ impl Application for Panel {
                 self.drag = None;
                 // Persist the final rect now that the user has released.
                 if let Some(r) = self.region {
-                    self.persist(|s, c| s.set_last_region(c, Some(r)));
+                    self.persist("last_region", &Some(r));
                 }
             }
             Msg::CancelSelection => {
                 tracing::info!("selection cancelled");
                 self.region = None;
                 self.drag = None;
-                self.persist(|s, c| s.set_last_region(c, None));
+                self.persist("last_region", &Option::<SelectionRect>::None);
             }
 
             Msg::ToplevelsLoaded(list) => {
                 tracing::debug!(count = list.len(), "toplevels loaded");
                 self.toplevels = list;
+            }
+            Msg::Tick => {
+                // No state mutation needed — the tick just triggers a
+                // re-render so view_stop_pill picks up a fresh elapsed time.
             }
             Msg::CaptureToplevel(identifier) => {
                 if !matches!(self.capture, CaptureState::Idle) {
@@ -519,15 +544,27 @@ impl Application for Panel {
                 } else if let Ok(p) = &r {
                     tracing::info!(path = %p, "capture pipeline finished");
                     if is_recording_path {
-                        // Drop the path onto the clipboard so users can
-                        // paste it into chat / a terminal / a file picker.
-                        // The `text` sentinel makes the helper advertise
-                        // all the common text MIME aliases.
-                        let bytes = p.as_bytes().to_vec();
-                        if let Err(e) =
-                            pipeline::screenshot::copy_bytes_to_clipboard(bytes, "text")
-                        {
-                            tracing::warn!(error = %e, "failed to copy path to clipboard");
+                        // Load the file off disk and put the bytes on the
+                        // clipboard with the right video/* MIME, so apps
+                        // that accept media on paste (chat clients, image
+                        // editors with video support, etc.) get the actual
+                        // payload rather than a path string. Read on the
+                        // blocking pool — recordings can be tens of MB.
+                        let path = std::path::PathBuf::from(p);
+                        let mime = self.record_format.mime();
+                        match std::fs::read(&path) {
+                            Ok(bytes) => {
+                                if let Err(e) =
+                                    pipeline::screenshot::copy_bytes_to_clipboard(bytes, mime)
+                                {
+                                    tracing::warn!(error = %e,
+                                        "failed to copy recording to clipboard");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(path = %p, error = %e,
+                                    "failed to read recording for clipboard");
+                            }
                         }
                     }
                 }
@@ -605,7 +642,15 @@ impl Application for Panel {
             },
             _ => None,
         });
-        Subscription::batch([outputs, keys])
+        // Periodic tick during recording so the elapsed-time label refreshes
+        // once per second. Skipped when not recording — no subscription at
+        // all means no wakeups when idle.
+        let tick = if matches!(self.capture, CaptureState::Recording { .. }) {
+            iced::time::every(std::time::Duration::from_secs(1)).map(|_| Msg::Tick)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([outputs, keys, tick])
     }
 }
 
@@ -731,9 +776,9 @@ impl Panel {
         }
         let id = window::Id::unique();
         self.stop_pill_id = Some(id);
-        // Width covers stop + cancel buttons + their padding; height covers
-        // a single 32px button row with 8/8 vertical padding.
-        const PILL_W: u32 = 140;
+        // Width covers stop + elapsed-time label + cancel button + padding;
+        // height covers a single 32px button row with 8/8 vertical padding.
+        const PILL_W: u32 = 220;
         const PILL_H: u32 = 56;
         get_layer_surface(SctkLayerSurfaceSettings {
             id,
@@ -795,36 +840,24 @@ impl Panel {
         if !on_an_output {
             tracing::info!(?region, "saved region is off-screen; clearing");
             self.region = None;
-            self.persist(|s, c| s.set_last_region(c, None));
+            self.persist("last_region", &Option::<SelectionRect>::None);
         }
     }
 
-    /// Helper to wrap a cosmic-config setter call. The closure receives the
-    /// UserSettings struct and Config handle and should call the appropriate
-    /// `set_<field>` method.
-    fn persist<F>(&self, f: F)
-    where
-        F: FnOnce(
-            &mut super::config::UserSettings,
-            &cosmic_config::Config,
-        ) -> Result<bool, cosmic_config::Error>,
-    {
+    /// Write a single field to cosmic-config. We bypass the derived
+    /// `set_<field>` helpers from `CosmicConfigEntry` because their
+    /// "if self.x != value, write" diff is meaningless when called on a
+    /// transient snapshot: we already built the snapshot from the caller's
+    /// up-to-date state, so the diff is always false and nothing lands on
+    /// disk. Callers filter at the message-handler level already, so we go
+    /// straight to `ConfigSet::set` and trust them.
+    fn persist<T: serde::Serialize>(&self, key: &str, value: &T) {
+        use cosmic_config::ConfigSet;
         let Some(config) = self.config.as_ref() else {
             return;
         };
-        // Build a snapshot of the current state matching the on-disk schema,
-        // then let the closure perform the targeted set. The derive-generated
-        // set_* methods write to disk only if the value differs.
-        let mut snapshot = super::config::UserSettings {
-            mode: self.mode,
-            source: self.source,
-            save_target: self.save_target,
-            record_format: self.record_format,
-            record_fps: self.record_fps,
-            last_region: self.region,
-        };
-        if let Err(e) = f(&mut snapshot, config) {
-            tracing::warn!(error = %e, "cosmic-config write failed");
+        if let Err(e) = config.set(key, value) {
+            tracing::warn!(key, error = %e, "cosmic-config write failed");
         }
     }
 
@@ -928,6 +961,7 @@ impl Panel {
                         RecordFormat::Gif => {
                             let args = self.build_gif_args();
                             self.capture = CaptureState::Recording { stop_tx: None };
+                            self.recording_started_at = Some(std::time::Instant::now());
                             Task::batch([
                                 close_bars,
                                 stop_pill,
@@ -944,6 +978,7 @@ impl Panel {
                             self.capture = CaptureState::Recording {
                                 stop_tx: Some(stop_tx),
                             };
+                            self.recording_started_at = Some(std::time::Instant::now());
                             Task::batch([
                                 close_bars,
                                 stop_pill,
@@ -1035,8 +1070,16 @@ impl Panel {
             .medium()
             .on_press(Msg::EscPressed);
 
-        let row = row::with_capacity(2)
+        let elapsed = self
+            .recording_started_at
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
+        let label = format_elapsed(elapsed);
+        let timer = cosmic::widget::text::body(label);
+
+        let row = row::with_capacity(3)
             .push(stop)
+            .push(timer)
             .push(cancel)
             .spacing(10)
             .align_y(iced::Alignment::Center);
@@ -1495,6 +1538,20 @@ async fn load_toplevels() -> Vec<crate::capture::toplevels::ToplevelSummary> {
 
 fn path_to_string(p: PathBuf) -> String {
     p.to_string_lossy().into_owned()
+}
+
+/// Format an elapsed-second count for the recording timer label.
+/// MM:SS under an hour, HH:MM:SS beyond — same shape OBS / cosmic-screenshot
+/// use for live recordings.
+fn format_elapsed(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
 }
 
 fn wayland_proxy_id(o: &WlOutput) -> u32 {
