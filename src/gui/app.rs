@@ -716,18 +716,25 @@ impl Panel {
     }
 
     /// Open a compact "recording in progress" pill at the bottom-center of
-    /// the active output. Sized to its content (size = None,None lets the
-    /// compositor honor the pill's natural width). Keyboard interactivity is
-    /// `None` — during recording the user is driving the apps being captured,
-    /// so keys flow through to whatever's focused beneath us. To stop, click
-    /// the pill (mouse routes correctly because the surface is small and
-    /// non-fullscreen).
+    /// the active output. Fixed size because the wlr-layer-shell protocol
+    /// requires an explicit width when the surface is only anchored to a
+    /// single edge (`set_size(0, 0)` is only valid when anchored to both
+    /// sides on at least one axis) — iced's layer-surface backend calls
+    /// `set_size(w.unwrap_or(0), h.unwrap_or(0))` unconditionally, so
+    /// `Some((None, None))` here would silently break the configure.
+    ///
+    /// Keyboard interactivity is `None` so keys flow through to whatever
+    /// app the user is recording. Stop/cancel are mouse-only.
     fn open_stop_pill(&mut self) -> Task<Msg> {
         if self.stop_pill_id.is_some() {
             return Task::none();
         }
         let id = window::Id::unique();
         self.stop_pill_id = Some(id);
+        // Width covers stop + cancel buttons + their padding; height covers
+        // a single 32px button row with 8/8 vertical padding.
+        const PILL_W: u32 = 140;
+        const PILL_H: u32 = 56;
         get_layer_surface(SctkLayerSurfaceSettings {
             id,
             layer: Layer::Overlay,
@@ -736,7 +743,7 @@ impl Panel {
             anchor: Anchor::BOTTOM,
             output: IcedOutput::Active,
             namespace: "cosmic-capture-stop-pill".to_string(),
-            size: Some((None, None)),
+            size: Some((Some(PILL_W), Some(PILL_H))),
             exclusive_zone: -1,
             size_limits: Limits::NONE.min_height(1.0).min_width(1.0),
             margin: IcedMargin {
