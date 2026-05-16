@@ -38,9 +38,7 @@ use cosmic::{Application, Element, executor};
 use tokio::sync::oneshot;
 use wayland_client::protocol::wl_output::WlOutput;
 
-use crate::cli::{
-    CommonArgs, GifArgs, RecordArgs, ScreenshotArgs, VideoContainer, VideoEncoder,
-};
+use crate::cli::{CommonArgs, GifArgs, RecordArgs, VideoContainer, VideoEncoder};
 use crate::encode::video::CropRect;
 use crate::pipeline;
 
@@ -164,10 +162,6 @@ pub struct Panel {
     rec_audio: bool,
     rec_cursor: bool,
 
-    sshot_interactive: bool,
-    sshot_modal: bool,
-    sshot_delay_ms: u64,
-
     notify: bool,
     clipboard: bool,
 
@@ -225,9 +219,6 @@ impl Application for Panel {
             rec_encoder: VideoEncoder::Auto,
             rec_audio: false,
             rec_cursor: true,
-            sshot_interactive: true,
-            sshot_modal: true,
-            sshot_delay_ms: 0,
             notify: true,
             clipboard: false,
             outputs: HashMap::new(),
@@ -547,14 +538,36 @@ impl Panel {
             }
             CaptureState::Idle => match self.mode {
                 Mode::Screenshot => {
-                    let args = self.build_screenshot_args();
+                    let Some(output_name) = self.active_output_name() else {
+                        tracing::warn!("no output detected; can't screenshot");
+                        return Task::none();
+                    };
+                    let crop = match self.source {
+                        Source::Region => self.crop_from_region(),
+                        Source::Screen | Source::Window => None,
+                    };
+                    let destination = match self.save_target {
+                        SaveTarget::Clipboard => pipeline::screenshot::Destination::Clipboard,
+                        SaveTarget::Pictures => pipeline::screenshot::Destination::File(None),
+                        SaveTarget::Documents => {
+                            let dest = dirs::document_dir().map(|d| {
+                                let stem = chrono::Local::now()
+                                    .format("cosmic-capture-%Y%m%d-%H%M%S");
+                                d.join(format!("{stem}.png"))
+                            });
+                            pipeline::screenshot::Destination::File(dest)
+                        }
+                    };
                     self.capture = CaptureState::Saving;
                     let close = self.close_selector_surfaces();
+                    let notify_user = self.notify;
+                    let cursor = self.rec_cursor;
                     Task::batch([
                         close,
-                        Task::perform(run_screenshot(args), |r| {
-                            cosmic::action::app(Msg::ScreenshotFinished(r))
-                        }),
+                        Task::perform(
+                            run_screenshot(output_name, cursor, crop, destination, notify_user),
+                            |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+                        ),
                     ])
                 }
                 Mode::Record => {
@@ -830,28 +843,11 @@ impl Panel {
             duration_secs: 0,
         }
     }
-    fn build_screenshot_args(&self) -> ScreenshotArgs {
-        let (file, clipboard) = match self.save_target {
-            SaveTarget::Pictures => (None, false),
-            SaveTarget::Documents => {
-                let dest = dirs::document_dir().map(|d| {
-                    let stem = chrono::Local::now().format("cosmic-capture-%Y%m%d-%H%M%S");
-                    d.join(format!("{stem}.png"))
-                });
-                (dest, false)
-            }
-            SaveTarget::Clipboard => (None, true),
-        };
-        ScreenshotArgs {
-            common: CommonArgs {
-                file,
-                notify: self.notify,
-                clipboard,
-            },
-            interactive: self.sshot_interactive,
-            modal: self.sshot_modal,
-            delay_ms: self.sshot_delay_ms,
-        }
+    fn active_output_name(&self) -> Option<String> {
+        // Same single-output assumption as `active_output_rect`. When we add
+        // multi-output positioning the toolbar will know which output it's
+        // anchored to and we'll thread that through here.
+        self.outputs.values().next().map(|o| o.name.clone())
     }
 }
 
@@ -930,10 +926,16 @@ async fn run_gif(args: GifArgs, crop: Option<CropRect>) -> Result<String, String
         .map(path_to_string)
         .map_err(|e| e.to_string())
 }
-async fn run_screenshot(args: ScreenshotArgs) -> Result<String, String> {
-    pipeline::screenshot::run(args)
+async fn run_screenshot(
+    output_name: String,
+    cursor: bool,
+    crop: Option<CropRect>,
+    destination: pipeline::screenshot::Destination,
+    notify_user: bool,
+) -> Result<String, String> {
+    pipeline::screenshot::capture_with(output_name, cursor, crop, destination, notify_user)
         .await
-        .map(|_| String::from("(saved)"))
+        .map(path_to_string)
         .map_err(|e| e.to_string())
 }
 fn path_to_string(p: PathBuf) -> String {

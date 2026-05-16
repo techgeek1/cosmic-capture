@@ -1,49 +1,17 @@
-use std::path::PathBuf;
+//! Screenshot capture entry-point.
+//!
+//! Just a thin wrapper around [`crate::capture::screencopy`] — runs the
+//! blocking screencopy call on a tokio blocking thread so it doesn't park
+//! the GUI event loop.
 
-use anyhow::{anyhow, Context, Result};
-use ashpd::desktop::screenshot::Screenshot;
+use anyhow::Result;
 
-pub struct Captured {
-    /// `file://` path the portal saved to (in a tmpdir).
-    pub source_path: PathBuf,
-    /// Was the result a clipboard handoff rather than a saved file?
-    pub clipboard: bool,
-}
+use super::screencopy::{self, CapturedFrame};
 
-pub async fn take(interactive: bool, modal: bool) -> Result<Captured> {
-    let response = Screenshot::request()
-        .interactive(interactive)
-        .modal(modal)
-        .send()
+pub use super::screencopy::Target;
+
+pub async fn take(target: Target, with_cursor: bool) -> Result<CapturedFrame> {
+    tokio::task::spawn_blocking(move || screencopy::capture(target, with_cursor))
         .await
-        .context("portal Screenshot::request send")?
-        .response();
-
-    let response = match response {
-        Err(err) => {
-            // ashpd surfaces user cancellation as an error; surface that as
-            // a typed condition the caller can handle silently.
-            if err.to_string().contains("Cancelled") {
-                anyhow::bail!(CaptureCancelled);
-            }
-            return Err(anyhow!(err)).context("portal Screenshot");
-        }
-        Ok(r) => r,
-    };
-
-    let uri = response.uri();
-    match uri.scheme() {
-        "file" => {
-            let path = uri
-                .to_file_path()
-                .map_err(|_| anyhow!("portal returned non-local file URI: {uri}"))?;
-            Ok(Captured { source_path: path, clipboard: false })
-        }
-        "clipboard" => Ok(Captured { source_path: PathBuf::new(), clipboard: true }),
-        other => Err(anyhow!("unsupported portal URI scheme: {other}")),
-    }
+        .map_err(|e| anyhow::anyhow!("screencopy task join: {e}"))?
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("capture cancelled by user")]
-pub struct CaptureCancelled;

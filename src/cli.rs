@@ -1,8 +1,9 @@
 //! CLI surface.
 //!
-//! The portal owns interactive source/region picking and cursor handling, so
-//! we deliberately keep the CLI minimal. Once we ship a libcosmic-based
-//! selector overlay we'll add `--region` + `--output` back as bypass paths.
+//! Screenshot capture goes through our own wlr-screencopy client (see
+//! `capture::screencopy`); recording still uses the ScreenCast portal for
+//! the PipeWire handoff. The GUI is the primary interaction surface — the
+//! CLI is deliberately minimal and covers headless / scripted use.
 
 use std::path::PathBuf;
 
@@ -18,7 +19,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Capture a still image via xdg-desktop-portal Screenshot.
+    /// Capture a still image via wlr-screencopy.
     Screenshot(ScreenshotArgs),
 
     /// Record a video clip via xdg-desktop-portal ScreenCast + GStreamer.
@@ -50,18 +51,8 @@ pub struct ScreenshotArgs {
     #[command(flatten)]
     pub common: CommonArgs,
 
-    /// Interactive portal mode: user picks the region/output via the
-    /// compositor's overlay. Disable for unattended scripts (whole screen).
-    #[arg(long, default_value_t = true,
-          num_args(0..=1), require_equals = true, default_missing_value = "true")]
-    pub interactive: bool,
-
-    /// Modal portal dialog (request keyboard/cursor focus).
-    #[arg(long, default_value_t = true,
-          num_args(0..=1), require_equals = true, default_missing_value = "true")]
-    pub modal: bool,
-
-    /// Delay before capture, in milliseconds.
+    /// Delay before capture, in milliseconds. Useful for catching menus or
+    /// tooltips that vanish when the capture UI grabs focus.
     #[arg(long, default_value_t = 0)]
     pub delay_ms: u64,
 }

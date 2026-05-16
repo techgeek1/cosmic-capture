@@ -25,15 +25,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "fs", "time"] }
 futures-util = "0.3"
 
-# xdg-desktop-portal client (Screenshot + ScreenCast)
+# xdg-desktop-portal client — only ScreenCast (PipeWire source) now;
+# Screenshot path captures via wlr-screencopy directly via cosmic-client-toolkit.
 ashpd = { version = "0.12", default-features = false, features = ["tokio"] }
 
-# Wayland layer-shell overlay for the region selector (B path)
+# Wayland layer-shell overlay for the region selector (B path), and the
+# screencopy client used by our screenshot pipeline.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop", "xkbcommon"] }
+cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086" }
 rustix = { version = "0.38", features = ["event"] }
+
+# PNG encode + Wayland clipboard for the screenshot output paths.
+png = "0.17"
+wl-clipboard-rs = "0.9"
 
 # COSMIC theme — used to pull the user's accent color for the selector border.
 cosmic-config = { git = "https://github.com/pop-os/libcosmic" }
