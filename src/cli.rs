@@ -27,6 +27,20 @@ pub enum Command {
 
     /// Capture a GIF via xdg-desktop-portal ScreenCast + gifski.
     Gif(GifArgs),
+
+    /// **Internal.** Re-exec'd by the GUI to host a wayland clipboard owner
+    /// that survives the parent's exit. Reads bytes from stdin and offers
+    /// them with the given mime type until something else claims the
+    /// clipboard. Not intended for direct use.
+    #[command(name = "__clipboard_serve", hide = true)]
+    ClipboardServe(ClipboardServeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ClipboardServeArgs {
+    /// MIME type to advertise for the clipboard contents.
+    #[arg(long)]
+    pub mime: String,
 }
 
 #[derive(Debug, Args, Clone)]

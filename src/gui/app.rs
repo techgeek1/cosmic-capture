@@ -25,7 +25,6 @@ use cosmic::iced::keyboard::Key;
 use cosmic::iced::keyboard::key::Named;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     Anchor, KeyboardInteractivity, Layer, destroy_layer_surface, get_layer_surface,
-    set_keyboard_interactivity,
 };
 use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
     IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
@@ -222,7 +221,17 @@ pub struct Panel {
     /// instance computes new rect coords from the same anchor + start_rect.
     /// `Some` only while the user is actively dragging.
     drag: Option<DragSession>,
+    /// Stop pill surface — opened only during recording. Lives at the
+    /// bottom-center of the active output as a compact stop+close pill
+    /// instead of the full toolbar (which would flicker as cursor moved
+    /// across its buttons and block clicks to the apps being recorded).
+    stop_pill_id: Option<window::Id>,
     capture: CaptureState,
+    /// Set true when Esc fires during recording. gst can't abort mid-stream
+    /// (the muxer would leave a corrupt file), so we still let it drain;
+    /// the *Finished message handler reads this flag and deletes the
+    /// pipeline's output instead of presenting it.
+    cancel_pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -280,7 +289,9 @@ impl Application for Panel {
             outputs: HashMap::new(),
             region: settings.last_region,
             drag: None,
+            stop_pill_id: None,
             capture: CaptureState::default(),
+            cancel_pending: false,
         };
 
         // No toolbar surface yet — we wait for OutputEvent::Created and open
@@ -429,11 +440,14 @@ impl Application for Panel {
                 return self.on_primary_action();
             }
             Msg::EscPressed => match &mut self.capture {
-                CaptureState::Recording { stop_tx, .. } => {
+                CaptureState::Recording { stop_tx } => {
+                    // Esc while recording = cancel: flag the pending output
+                    // for deletion, then signal the pipeline to drain. We
+                    // can't kill it mid-stream without corrupting the file.
+                    self.cancel_pending = true;
                     if let Some(tx) = stop_tx.take() {
                         let _ = tx.send(());
                     }
-                    self.capture = CaptureState::Saving;
                 }
                 CaptureState::Idle => {
                     // Not recording → Esc exits the application entirely.
@@ -442,13 +456,43 @@ impl Application for Panel {
                 _ => {}
             },
 
-            Msg::RecordingFinished(r) | Msg::GifFinished(r) | Msg::ScreenshotFinished(r) => {
-                // Done — close everything and exit. Desktop notifications
-                // surface the saved-path / error to the user.
-                if let Err(e) = &r {
+            msg @ (Msg::RecordingFinished(_) | Msg::GifFinished(_) | Msg::ScreenshotFinished(_)) => {
+                // is_recording_path lets us decide whether to copy the saved
+                // file path onto the clipboard — only for actual recordings
+                // (video / gif), since screenshot paths are the file the
+                // user asked for and they may have chosen the Clipboard
+                // target already.
+                let is_recording_path =
+                    matches!(msg, Msg::RecordingFinished(_) | Msg::GifFinished(_));
+                let r = match msg {
+                    Msg::RecordingFinished(r) | Msg::GifFinished(r) | Msg::ScreenshotFinished(r) => r,
+                    _ => unreachable!(),
+                };
+                if self.cancel_pending {
+                    if let Ok(p) = &r {
+                        let path = std::path::PathBuf::from(p);
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => tracing::info!(path = %p, "cancelled — deleted output"),
+                            Err(e) => tracing::warn!(path = %p, error = %e,
+                                "cancelled — failed to delete output"),
+                        }
+                    }
+                } else if let Err(e) = &r {
                     tracing::warn!(error = %e, "capture pipeline finished with error");
                 } else if let Ok(p) = &r {
                     tracing::info!(path = %p, "capture pipeline finished");
+                    if is_recording_path {
+                        // Drop the path onto the clipboard so users can
+                        // paste it into chat / a terminal / a file picker.
+                        // The `text` sentinel makes the helper advertise
+                        // all the common text MIME aliases.
+                        let bytes = p.as_bytes().to_vec();
+                        if let Err(e) =
+                            pipeline::screenshot::copy_bytes_to_clipboard(bytes, "text")
+                        {
+                            tracing::warn!(error = %e, "failed to copy path to clipboard");
+                        }
+                    }
                 }
                 return self.shutdown();
             }
@@ -470,6 +514,12 @@ impl Application for Panel {
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Msg> {
+        // Stop pill — small bottom-centered surface that replaces the
+        // toolbars while a recording is in progress. Owns the Exclusive
+        // keyboard grab during recording so Space/Esc continue to work.
+        if Some(id) == self.stop_pill_id {
+            return self.view_stop_pill();
+        }
         // Toolbar surface — every output gets its own. The pill renders
         // identically on each; the selection canvas underneath is scoped to
         // that output's bounds.
@@ -506,13 +556,16 @@ impl Application for Panel {
             _ => None,
         });
         let keys = event::listen_with(|e, _, _| match e {
-            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
-                if let Key::Named(Named::Escape) = key {
-                    Some(Msg::EscPressed)
-                } else {
-                    None
-                }
-            }
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => match key {
+                Key::Named(Named::Escape) => Some(Msg::EscPressed),
+                // Space triggers Capture / Start record / Stop record —
+                // mirrors cosmic-screenshot's hotkey. The wayland keymap in
+                // iced translates `XK_space` to `Key::Character(" ")`, so
+                // match that here (Named::Space is the cross-platform form
+                // some other backends emit).
+                Key::Character(s) if s.as_str() == " " => Some(Msg::PrimaryAction),
+                _ => None,
+            },
             _ => None,
         });
         Subscription::batch([outputs, keys])
@@ -605,16 +658,47 @@ impl Panel {
         Task::batch(tasks)
     }
 
-    /// Drop keyboard interactivity on every toolbar surface — called when
-    /// recording starts so the user can drive the apps they're capturing.
-    fn release_toolbar_keyboards(&self) -> Task<Msg> {
+    /// Tear down every per-output toolbar surface. Called when recording
+    /// starts so cursor motion across the (no-longer-needed) pills can't
+    /// trigger hover-state redraws — that's the flicker.
+    fn close_toolbars(&mut self) -> Task<Msg> {
         let mut tasks: Vec<Task<Msg>> = Vec::new();
-        for info in self.outputs.values() {
-            if let Some(id) = info.toolbar_id {
-                tasks.push(set_keyboard_interactivity(id, KeyboardInteractivity::None));
+        for info in self.outputs.values_mut() {
+            if let Some(id) = info.toolbar_id.take() {
+                tasks.push(destroy_layer_surface(id));
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Open a compact "recording in progress" pill at the bottom-center of
+    /// the active output. Sized to its content (size = None,None lets the
+    /// compositor honor the pill's natural width) and Exclusive on keyboard
+    /// so Space/Esc keep working during recording.
+    fn open_stop_pill(&mut self) -> Task<Msg> {
+        if self.stop_pill_id.is_some() {
+            return Task::none();
+        }
+        let id = window::Id::unique();
+        self.stop_pill_id = Some(id);
+        get_layer_surface(SctkLayerSurfaceSettings {
+            id,
+            layer: Layer::Overlay,
+            keyboard_interactivity: KeyboardInteractivity::Exclusive,
+            input_zone: None,
+            anchor: Anchor::BOTTOM,
+            output: IcedOutput::Active,
+            namespace: "cosmic-capture-stop-pill".to_string(),
+            size: Some((None, None)),
+            exclusive_zone: -1,
+            size_limits: Limits::NONE.min_height(1.0).min_width(1.0),
+            margin: IcedMargin {
+                top: 0,
+                right: 0,
+                bottom: TOOLBAR_BOTTOM_MARGIN as i32,
+                left: 0,
+            },
+        })
     }
 
     /// Destroy every surface we own and exit the iced runtime. Used by both
@@ -622,6 +706,9 @@ impl Panel {
     /// paths.
     fn shutdown(&mut self) -> Task<Msg> {
         let mut tasks: Vec<Task<Msg>> = Vec::new();
+        if let Some(id) = self.stop_pill_id.take() {
+            tasks.push(destroy_layer_surface(id));
+        }
         for info in self.outputs.values_mut() {
             if let Some(id) = info.toolbar_id.take() {
                 tasks.push(destroy_layer_surface(id));
@@ -758,15 +845,21 @@ impl Panel {
                         Source::Region => self.crop_from_region(),
                         Source::Screen | Source::Window => None,
                     };
+                    // Recording switchover: tear down the per-output
+                    // toolbars (their hover-state redraws were flickering)
+                    // and replace with a compact bottom stop pill + the
+                    // pointer-transparent recording border overlays.
+                    let close_bars = self.close_toolbars();
+                    let stop_pill = self.open_stop_pill();
                     let swap = self.open_recording_overlays();
-                    // Recording → toolbars must stop hogging keyboard so the
-                    // user can drive the apps they're capturing.
-                    let release_kb = self.release_toolbar_keyboards();
+                    let release_kb = Task::none();
                     match self.record_format {
                         RecordFormat::Gif => {
                             let args = self.build_gif_args();
                             self.capture = CaptureState::Recording { stop_tx: None };
                             Task::batch([
+                                close_bars,
+                                stop_pill,
                                 swap,
                                 release_kb,
                                 Task::perform(run_gif(args, crop), |r| {
@@ -781,6 +874,8 @@ impl Panel {
                                 stop_tx: Some(stop_tx),
                             };
                             Task::batch([
+                                close_bars,
+                                stop_pill,
                                 swap,
                                 release_kb,
                                 Task::perform(run_record(args, crop, stop_rx), |r| {
@@ -793,6 +888,40 @@ impl Panel {
             },
             CaptureState::Saving => Task::none(),
         }
+    }
+
+    /// Compact pill shown while a recording is in progress. Just the Stop
+    /// button (which forwards to `PrimaryAction`) and a Quit icon for
+    /// cancel-with-discard via the existing Esc path.
+    fn view_stop_pill(&self) -> Element<'_, Msg> {
+        let press_stop = matches!(self.capture, CaptureState::Recording { .. })
+            .then_some(Msg::PrimaryAction);
+        let stop = record_button(&self.capture, press_stop.is_some(), press_stop);
+        let cancel = button::icon(icon::from_name("window-close-symbolic"))
+            .medium()
+            .on_press(Msg::EscPressed);
+
+        let row = row::with_capacity(2)
+            .push(stop)
+            .push(cancel)
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+
+        container(row)
+            .padding([8, 12, 8, 12])
+            .class(cosmic::theme::Container::Custom(Box::new(|theme| {
+                let t = theme.cosmic();
+                cosmic::iced::widget::container::Style {
+                    background: Some(Background::Color(t.background.component.base.into())),
+                    text_color: Some(t.background.component.on.into()),
+                    border: Border {
+                        radius: t.corner_radii.radius_s.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })))
+            .into()
     }
 
     fn view_toolbar(&self, info: &OutputInfo) -> Element<'_, Msg> {

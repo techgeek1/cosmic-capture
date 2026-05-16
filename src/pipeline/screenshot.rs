@@ -8,7 +8,7 @@ use tokio::time::{Duration, sleep};
 
 use crate::capture::screencopy::{self, CapturedFrame};
 use crate::capture::screenshot::{self, Target};
-use crate::cli::ScreenshotArgs;
+use crate::cli::{ClipboardServeArgs, ScreenshotArgs};
 use crate::encode::video::CropRect;
 use crate::{notify, paths};
 
@@ -102,25 +102,94 @@ async fn encode_to_clipboard(
     let (pixels, w, h) = resolve_crop(frame, crop)?;
     let mut png_bytes: Vec<u8> = Vec::with_capacity((w as usize) * (h as usize) * 2);
     write_png(&mut png_bytes, &pixels, w, h)?;
-    tokio::task::spawn_blocking(move || copy_png_to_clipboard(png_bytes))
+    tokio::task::spawn_blocking(move || copy_bytes_to_clipboard(png_bytes, "image/png"))
         .await
         .map_err(|e| anyhow::anyhow!("clipboard task join: {e}"))??;
     Ok(())
 }
 
-fn copy_png_to_clipboard(png_bytes: Vec<u8>) -> Result<()> {
+/// Push raw bytes to the wayland clipboard via the hidden subprocess helper.
+/// Public so the GUI can stash a saved video's path on the clipboard after a
+/// successful recording.
+pub fn copy_bytes_to_clipboard(bytes: Vec<u8>, mime: &str) -> Result<()> {
+    copy_to_clipboard_impl(bytes, mime)
+}
+
+/// Hand bytes off to a child `cosmic-capture __clipboard_serve` process.
+///
+/// Why a subprocess? `wl_clipboard_rs`'s `foreground(false)` mode runs the
+/// serve loop on a `thread::spawn` inside the calling process — so when iced
+/// exits after capture, the thread dies and the wayland clipboard ownership
+/// lapses, leaving paste targets empty.
+///
+/// A child process gets reparented to PID 1 when we exit, keeps holding the
+/// selection, and naturally terminates the next time something else claims
+/// the clipboard.
+fn copy_to_clipboard_impl(bytes: Vec<u8>, mime: &str) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let me = std::env::current_exe().context("current_exe")?;
+    let mut child = Command::new(&me)
+        .arg("__clipboard_serve")
+        .arg("--mime")
+        .arg(mime)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn {} __clipboard_serve", me.display()))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("clipboard helper missing stdin"))?;
+        stdin
+            .write_all(&bytes)
+            .context("pipe payload to clipboard helper")?;
+        // Drop closes stdin → helper proceeds to claim the selection.
+    }
+    // Deliberately don't wait — the helper outlives us by design.
+    Ok(())
+}
+
+/// Implementation of the hidden `__clipboard_serve` subcommand. Reads bytes
+/// from stdin, then calls into wl-clipboard-rs' foreground serve loop to
+/// hold the wayland selection until the compositor revokes it.
+///
+/// `--mime text` is special-cased to wl-clipboard-rs' `MimeType::Text`,
+/// which advertises the payload as `text/plain;charset=utf-8`, `text/plain`,
+/// `STRING`, `UTF8_STRING`, and `TEXT`. Anything else passes through as a
+/// `MimeType::Specific(...)`.
+pub fn serve_clipboard(args: ClipboardServeArgs) -> Result<()> {
+    use std::io::Read;
     use wl_clipboard_rs::copy::{MimeType, Options, ServeRequests, Source};
+
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .context("read clipboard payload from stdin")?;
+    if bytes.is_empty() {
+        anyhow::bail!("clipboard payload was empty");
+    }
+
+    let mime = if args.mime == "text" {
+        MimeType::Text
+    } else {
+        MimeType::Specific(args.mime)
+    };
+
     let mut opts = Options::new();
-    // Foreground = false → daemonize the copy server so the bytes survive
-    // after this process exits. ServeRequests::Unlimited so any number of
-    // paste consumers can read the contents.
-    opts.foreground(false);
+    // foreground = true → block in this process, serving requests until the
+    // selection is taken away from us. Without it, prepare_copy panics.
+    opts.foreground(true);
     opts.serve_requests(ServeRequests::Unlimited);
-    opts.copy(
-        Source::Bytes(png_bytes.into_boxed_slice()),
-        MimeType::Specific("image/png".to_string()),
-    )
-    .map_err(|e| anyhow::anyhow!("wl-clipboard copy: {e}"))?;
+    let prepared = opts
+        .prepare_copy(Source::Bytes(bytes.into_boxed_slice()), mime)
+        .map_err(|e| anyhow::anyhow!("wl-clipboard prepare_copy: {e}"))?;
+    prepared
+        .serve()
+        .map_err(|e| anyhow::anyhow!("wl-clipboard serve: {e}"))?;
     Ok(())
 }
 
