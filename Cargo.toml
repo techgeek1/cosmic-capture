@@ -34,7 +34,7 @@ ashpd = { version = "0.12", default-features = false, features = ["tokio"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop", "xkbcommon"] }
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop", "xkbcommon"] }
 cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086" }
 rustix = { version = "0.38", features = ["event"] }
 

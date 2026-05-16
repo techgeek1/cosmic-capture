@@ -8,6 +8,7 @@ use tokio::time::{Duration, sleep};
 
 use crate::capture::screencopy::{self, CapturedFrame};
 use crate::capture::screenshot::{self, Target};
+use crate::capture::toplevels;
 use crate::cli::{ClipboardServeArgs, ScreenshotArgs};
 use crate::encode::video::CropRect;
 use crate::{notify, paths};
@@ -71,6 +72,40 @@ pub async fn capture_with(
         Destination::File(user_path) => {
             let dest = paths::resolve(user_path, paths::Kind::Image, "png")?;
             encode_to_file(&frame, crop, &dest)?;
+            if notify_user {
+                if let Err(e) = notify::saved(&dest, "Screenshot").await {
+                    tracing::warn!(error = %e, "failed to send notification");
+                }
+            }
+            Ok(dest)
+        }
+    }
+}
+
+/// GUI entry — per-window capture. `identifier` is the stable string from
+/// `ext_foreign_toplevel_list_v1`'s `identifier` event. Crop is unsupported
+/// (we hand back exactly what the compositor renders for the toplevel).
+pub async fn capture_toplevel(
+    identifier: String,
+    with_cursor: bool,
+    destination: Destination,
+    notify_user: bool,
+) -> Result<PathBuf> {
+    let frame = tokio::task::spawn_blocking(move || toplevels::capture(&identifier, with_cursor))
+        .await
+        .map_err(|e| anyhow::anyhow!("toplevel capture task join: {e}"))??;
+
+    match destination {
+        Destination::Clipboard => {
+            encode_to_clipboard(&frame, None).await?;
+            if notify_user {
+                let _ = notify::saved(std::path::Path::new("clipboard"), "Screenshot").await;
+            }
+            Ok(PathBuf::from("clipboard"))
+        }
+        Destination::File(user_path) => {
+            let dest = paths::resolve(user_path, paths::Kind::Image, "png")?;
+            encode_to_file(&frame, None, &dest)?;
             if notify_user {
                 if let Err(e) = notify::saved(&dest, "Screenshot").await {
                     tracing::warn!(error = %e, "failed to send notification");

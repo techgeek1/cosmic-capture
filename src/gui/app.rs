@@ -216,6 +216,10 @@ pub struct Panel {
     clipboard: bool,
 
     outputs: HashMap<u32, OutputInfo>,
+    /// Toplevels available for `Source::Window` capture. Refreshed when the
+    /// user enters Window mode (cosmic-protocols' toplevel_info doesn't
+    /// stream from a long-lived connection here yet — see capture::toplevels).
+    toplevels: Vec<crate::capture::toplevels::ToplevelSummary>,
     region: Option<SelectionRect>,
     /// Active drag session lifted out of the widget so every per-output
     /// instance computes new rect coords from the same anchor + start_rect.
@@ -246,6 +250,14 @@ pub enum Msg {
     Selection(SelectionEvent),
     CancelSelection,
     EscPressed,
+
+    /// Toplevel enumeration finished. `Vec` may be empty if cosmic-comp
+    /// doesn't advertise `ext_foreign_toplevel_list_v1` or the user has no
+    /// windows open. Errors are logged and the list is left empty.
+    ToplevelsLoaded(Vec<crate::capture::toplevels::ToplevelSummary>),
+    /// User picked a specific window — pulls the identifier from the toplevel
+    /// snapshot and kicks the screenshot pipeline at it.
+    CaptureToplevel(String),
 
     ToggleClipboard,
 
@@ -287,6 +299,7 @@ impl Application for Panel {
             notify: true,
             clipboard: false,
             outputs: HashMap::new(),
+            toplevels: Vec::new(),
             region: settings.last_region,
             drag: None,
             stop_pill_id: None,
@@ -313,6 +326,12 @@ impl Application for Panel {
                 if !self.locked() && self.source != s {
                     self.source = s;
                     self.persist(|st, c| st.set_source(c, s));
+                    if matches!(s, Source::Window) {
+                        // Kick off a fresh toplevel enumeration.
+                        return Task::perform(load_toplevels(), |list| {
+                            cosmic::action::app(Msg::ToplevelsLoaded(list))
+                        });
+                    }
                 }
             }
             Msg::ToggleClipboard => self.clipboard = !self.clipboard,
@@ -433,6 +452,24 @@ impl Application for Panel {
                 self.region = None;
                 self.drag = None;
                 self.persist(|s, c| s.set_last_region(c, None));
+            }
+
+            Msg::ToplevelsLoaded(list) => {
+                tracing::debug!(count = list.len(), "toplevels loaded");
+                self.toplevels = list;
+            }
+            Msg::CaptureToplevel(identifier) => {
+                if !matches!(self.capture, CaptureState::Idle) {
+                    return Task::none();
+                }
+                let destination = self.current_destination();
+                let notify_user = self.notify;
+                let cursor = self.rec_cursor;
+                self.capture = CaptureState::Saving;
+                return Task::perform(
+                    run_toplevel_screenshot(identifier, cursor, destination, notify_user),
+                    |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+                );
             }
 
             Msg::PrimaryAction => {
@@ -585,6 +622,10 @@ impl Panel {
             return false;
         }
         match (self.mode, self.source) {
+            // Window source captures fire from picker button clicks
+            // (Msg::CaptureToplevel) — the toolbar's primary action stays
+            // inactive because there's no implicit "default window".
+            (Mode::Screenshot, Source::Window) => false,
             (Mode::Screenshot, _) => true,
             (Mode::Record, Source::Screen) => true,
             (Mode::Record, Source::Region) => self.region.is_some(),
@@ -798,6 +839,23 @@ impl Panel {
         })
     }
 
+    /// Translate the current `save_target` into a screenshot pipeline
+    /// `Destination`. Shared between the region/screen capture path and the
+    /// per-window capture path.
+    fn current_destination(&self) -> pipeline::screenshot::Destination {
+        match self.save_target {
+            SaveTarget::Clipboard => pipeline::screenshot::Destination::Clipboard,
+            SaveTarget::Pictures => pipeline::screenshot::Destination::File(None),
+            SaveTarget::Documents => {
+                let dest = dirs::document_dir().map(|d| {
+                    let stem = chrono::Local::now().format("cosmic-capture-%Y%m%d-%H%M%S");
+                    d.join(format!("{stem}.png"))
+                });
+                pipeline::screenshot::Destination::File(dest)
+            }
+        }
+    }
+
     fn on_primary_action(&mut self) -> Task<Msg> {
         match &mut self.capture {
             CaptureState::Recording { stop_tx, .. } => {
@@ -890,6 +948,69 @@ impl Panel {
         }
     }
 
+    /// Centered picker rendered when `Source::Window` is active. Each
+    /// toplevel becomes a button in a column; clicking it kicks off a
+    /// screencopy capture of that window.
+    ///
+    /// No thumbnails yet — this is title-only. Pre-capturing thumbnails per
+    /// toplevel needs a long-lived wayland connection that streams updates
+    /// into the GUI; that's a follow-up.
+    fn view_window_picker(&self) -> Element<'_, Msg> {
+        use cosmic::iced::widget::scrollable;
+
+        let mut col = iced::widget::column::with_capacity(self.toplevels.len().max(1))
+            .spacing(6)
+            .align_x(iced::Alignment::Center);
+        if self.toplevels.is_empty() {
+            col = col.push(
+                container(cosmic::widget::text::body("No windows available."))
+                    .padding(12),
+            );
+        } else {
+            for tl in &self.toplevels {
+                let label = if tl.title.is_empty() {
+                    if tl.app_id.is_empty() {
+                        tl.identifier.clone()
+                    } else {
+                        tl.app_id.clone()
+                    }
+                } else {
+                    tl.title.clone()
+                };
+                let id = tl.identifier.clone();
+                col = col.push(
+                    button::standard(label)
+                        .on_press(Msg::CaptureToplevel(id))
+                        .width(Length::Fixed(360.0)),
+                );
+            }
+        }
+
+        let inner = container(scrollable(col))
+            .padding(16)
+            .width(Length::Shrink)
+            .height(Length::Shrink)
+            .class(cosmic::theme::Container::Custom(Box::new(|theme| {
+                let t = theme.cosmic();
+                cosmic::iced::widget::container::Style {
+                    background: Some(Background::Color(t.background.component.base.into())),
+                    text_color: Some(t.background.component.on.into()),
+                    border: Border {
+                        radius: t.corner_radii.radius_s.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            })));
+
+        container(inner)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::Alignment::Center)
+            .align_y(iced::Alignment::Center)
+            .into()
+    }
+
     /// Compact pill shown while a recording is in progress. Just the Stop
     /// button (which forwards to `PrimaryAction`) and a Quit icon for
     /// cancel-with-discard via the existing Esc path.
@@ -953,14 +1074,22 @@ impl Panel {
         };
         let region_press = (!self.locked()).then_some(Msg::SetSource(Source::Region));
         let screen_press = (!self.locked()).then_some(Msg::SetSource(Source::Screen));
+        // Window source: screenshot only — record/gif pipelines don't have a
+        // toplevel-aware screencast path yet, so leave the button disabled in
+        // Record mode.
+        let window_press = (!self.locked() && matches!(self.mode, Mode::Screenshot))
+            .then_some(Msg::SetSource(Source::Window));
         let sources = row::with_capacity(3)
             .push(source_icon(
                 "screenshot-selection-symbolic",
                 Source::Region,
                 region_press,
             ))
-            // Window mode not yet implemented — present but disabled.
-            .push(source_icon("screenshot-window-symbolic", Source::Window, None))
+            .push(source_icon(
+                "screenshot-window-symbolic",
+                Source::Window,
+                window_press,
+            ))
             .push(source_icon(
                 "screenshot-screen-symbolic",
                 Source::Screen,
@@ -1117,6 +1246,10 @@ impl Panel {
 
         if pre_capture && matches!(self.source, Source::Screen) {
             stack = stack.push(fullscreen_border());
+        }
+
+        if pre_capture && matches!(self.source, Source::Window) {
+            stack = stack.push(self.view_window_picker());
         }
 
         stack.push(pill_layer).into()
@@ -1313,6 +1446,34 @@ async fn run_screenshot(
         .map(path_to_string)
         .map_err(|e| e.to_string())
 }
+async fn run_toplevel_screenshot(
+    identifier: String,
+    cursor: bool,
+    destination: pipeline::screenshot::Destination,
+    notify_user: bool,
+) -> Result<String, String> {
+    pipeline::screenshot::capture_toplevel(identifier, cursor, destination, notify_user)
+        .await
+        .map(path_to_string)
+        .map_err(|e| e.to_string())
+}
+
+/// Run toplevel enumeration on the blocking pool. Empty result on error so
+/// the caller doesn't need to thread a Result through the message enum.
+async fn load_toplevels() -> Vec<crate::capture::toplevels::ToplevelSummary> {
+    match tokio::task::spawn_blocking(crate::capture::toplevels::list).await {
+        Ok(Ok(list)) => list,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "toplevel enumeration failed");
+            Vec::new()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "toplevel enumeration task join failed");
+            Vec::new()
+        }
+    }
+}
+
 fn path_to_string(p: PathBuf) -> String {
     p.to_string_lossy().into_owned()
 }
