@@ -622,14 +622,17 @@ impl Panel {
             return false;
         }
         match (self.mode, self.source) {
-            // Window source captures fire from picker button clicks
-            // (Msg::CaptureToplevel) — the toolbar's primary action stays
+            // Screenshot+Window: captures fire from picker button clicks
+            // (Msg::CaptureToplevel). Toolbar's primary action stays
             // inactive because there's no implicit "default window".
             (Mode::Screenshot, Source::Window) => false,
             (Mode::Screenshot, _) => true,
+            // Record+Window: the screencast portal already advertises both
+            // Monitor and Window source types — the user picks one in the
+            // portal dialog. Our toolbar just kicks the flow.
+            (Mode::Record, Source::Window) => true,
             (Mode::Record, Source::Screen) => true,
             (Mode::Record, Source::Region) => self.region.is_some(),
-            (Mode::Record, Source::Window) => false, // not yet wired
         }
     }
 
@@ -714,8 +717,11 @@ impl Panel {
 
     /// Open a compact "recording in progress" pill at the bottom-center of
     /// the active output. Sized to its content (size = None,None lets the
-    /// compositor honor the pill's natural width) and Exclusive on keyboard
-    /// so Space/Esc keep working during recording.
+    /// compositor honor the pill's natural width). Keyboard interactivity is
+    /// `None` — during recording the user is driving the apps being captured,
+    /// so keys flow through to whatever's focused beneath us. To stop, click
+    /// the pill (mouse routes correctly because the surface is small and
+    /// non-fullscreen).
     fn open_stop_pill(&mut self) -> Task<Msg> {
         if self.stop_pill_id.is_some() {
             return Task::none();
@@ -725,7 +731,7 @@ impl Panel {
         get_layer_surface(SctkLayerSurfaceSettings {
             id,
             layer: Layer::Overlay,
-            keyboard_interactivity: KeyboardInteractivity::Exclusive,
+            keyboard_interactivity: KeyboardInteractivity::None,
             input_zone: None,
             anchor: Anchor::BOTTOM,
             output: IcedOutput::Active,
@@ -1074,11 +1080,11 @@ impl Panel {
         };
         let region_press = (!self.locked()).then_some(Msg::SetSource(Source::Region));
         let screen_press = (!self.locked()).then_some(Msg::SetSource(Source::Screen));
-        // Window source: screenshot only — record/gif pipelines don't have a
-        // toplevel-aware screencast path yet, so leave the button disabled in
-        // Record mode.
-        let window_press = (!self.locked() && matches!(self.mode, Mode::Screenshot))
-            .then_some(Msg::SetSource(Source::Window));
+        // Window source works in both modes. In Screenshot mode we show our
+        // own toplevel picker; in Record mode the screencast portal dialog
+        // already advertises Window as a source type so picking it there
+        // routes the PipeWire stream through unchanged.
+        let window_press = (!self.locked()).then_some(Msg::SetSource(Source::Window));
         let sources = row::with_capacity(3)
             .push(source_icon(
                 "screenshot-selection-symbolic",
@@ -1248,7 +1254,13 @@ impl Panel {
             stack = stack.push(fullscreen_border());
         }
 
-        if pre_capture && matches!(self.source, Source::Window) {
+        if pre_capture
+            && matches!(self.source, Source::Window)
+            && matches!(self.mode, Mode::Screenshot)
+        {
+            // Record-mode window capture is driven through the ScreenCast
+            // portal dialog (it already advertises Window as a source type),
+            // so we only render our own picker for screenshots.
             stack = stack.push(self.view_window_picker());
         }
 

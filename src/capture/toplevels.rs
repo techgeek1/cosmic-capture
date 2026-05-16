@@ -24,6 +24,7 @@ use cosmic_client_toolkit::{
         ScreencopySessionDataExt, ScreencopyState,
     },
     toplevel_info::{ToplevelInfoHandler, ToplevelInfoState},
+    workspace::{WorkspaceHandler, WorkspaceState},
 };
 use smithay_client_toolkit::{
     output::{OutputHandler, OutputState},
@@ -48,25 +49,38 @@ pub struct ToplevelSummary {
 }
 
 /// Enumerate all current toplevels. Blocking — run via `spawn_blocking`.
+///
+/// The wayland protocol delivers toplevel state across several events
+/// (`identifier`, `title`, `app_id`, `done`, plus per-toplevel `done`),
+/// possibly spread over multiple roundtrips. We dispatch up to ~500ms,
+/// breaking early as soon as `info_done` fires (cosmic-protocol v3+ signal
+/// for "initial batch complete").
 pub fn list() -> Result<Vec<ToplevelSummary>> {
     let conn = Connection::connect_to_env().context("connect wayland")?;
     let (globals, mut q) = registry_queue_init::<EnumData>(&conn).context("registry_queue_init")?;
     let qh = q.handle();
 
     let registry_state = RegistryState::new(&globals);
+    // Output and Workspace must exist before ToplevelInfo — toplevel_info
+    // events reference workspace handles and output handles, so wayland-
+    // client needs Dispatch impls for those types before processing toplevel
+    // events that create them.
     let mut data = EnumData {
         output_state: OutputState::new(&globals, &qh),
+        workspace_state: WorkspaceState::new(&registry_state, &qh),
         toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
         registry_state,
         info_done: false,
     };
 
-    // Drain initial advertisements; `info_done` fires once the compositor
-    // has sent its initial batch of toplevels.
-    for _ in 0..8 {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !data.info_done && Instant::now() < deadline {
         q.roundtrip(&mut data).context("roundtrip for toplevels")?;
-        if data.info_done {
-            break;
+        if !data.info_done {
+            // Give the compositor a moment to emit follow-up events
+            // (title/app_id arrive separately from the `toplevel` event).
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -80,6 +94,7 @@ pub fn list() -> Result<Vec<ToplevelSummary>> {
         })
         .collect();
     out.sort_by(|a, b| a.title.cmp(&b.title));
+    tracing::debug!(count = out.len(), info_done = data.info_done, "toplevel enumeration complete");
     Ok(out)
 }
 
@@ -95,6 +110,7 @@ pub fn capture(identifier: &str, with_cursor: bool) -> Result<CapturedFrame> {
     let registry_state = RegistryState::new(&globals);
     let mut data = AppData {
         output_state: OutputState::new(&globals, &qh),
+        workspace_state: WorkspaceState::new(&registry_state, &qh),
         toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
         shm_state: Shm::bind(&globals, &qh).context("bind wl_shm")?,
         screencopy_state: ScreencopyState::new(&globals, &qh),
@@ -103,10 +119,12 @@ pub fn capture(identifier: &str, with_cursor: bool) -> Result<CapturedFrame> {
         info_done: false,
     };
 
-    for _ in 0..8 {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while !data.info_done && Instant::now() < deadline {
         q.roundtrip(&mut data).context("roundtrip for toplevels")?;
-        if data.info_done {
-            break;
+        if !data.info_done {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -149,8 +167,16 @@ pub fn capture(identifier: &str, with_cursor: bool) -> Result<CapturedFrame> {
 struct EnumData {
     output_state: OutputState,
     registry_state: RegistryState,
+    workspace_state: WorkspaceState,
     toplevel_info_state: ToplevelInfoState,
     info_done: bool,
+}
+
+impl WorkspaceHandler for EnumData {
+    fn workspace_state(&mut self) -> &mut WorkspaceState {
+        &mut self.workspace_state
+    }
+    fn done(&mut self) {}
 }
 
 impl ProvidesRegistryState for EnumData {
@@ -202,17 +228,26 @@ impl ToplevelInfoHandler for EnumData {
 smithay_client_toolkit::delegate_output!(EnumData);
 smithay_client_toolkit::delegate_registry!(EnumData);
 cosmic_client_toolkit::delegate_toplevel_info!(EnumData);
+cosmic_client_toolkit::delegate_workspace!(EnumData);
 
 // ---- enumeration + screencopy handlers ----
 
 struct AppData {
     output_state: OutputState,
     registry_state: RegistryState,
+    workspace_state: WorkspaceState,
     toplevel_info_state: ToplevelInfoState,
     shm_state: Shm,
     screencopy_state: ScreencopyState,
     result: Arc<Mutex<Option<Result<CapturedFrame, String>>>>,
     info_done: bool,
+}
+
+impl WorkspaceHandler for AppData {
+    fn workspace_state(&mut self) -> &mut WorkspaceState {
+        &mut self.workspace_state
+    }
+    fn done(&mut self) {}
 }
 
 impl ProvidesRegistryState for AppData {
@@ -388,6 +423,7 @@ smithay_client_toolkit::delegate_output!(AppData);
 smithay_client_toolkit::delegate_registry!(AppData);
 smithay_client_toolkit::delegate_shm!(AppData);
 cosmic_client_toolkit::delegate_toplevel_info!(AppData);
+cosmic_client_toolkit::delegate_workspace!(AppData);
 cosmic_client_toolkit::delegate_screencopy!(AppData);
 delegate_noop!(AppData: ignore wl_buffer::WlBuffer);
 
