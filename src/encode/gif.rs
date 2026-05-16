@@ -145,7 +145,7 @@ impl GifSession {
         })
     }
 
-    pub async fn run(self, duration_secs: u64) -> Result<()> {
+    pub async fn run(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
         self.pipeline.set_state(State::Playing).context("pipeline → Playing")?;
 
         let bus = self.pipeline.bus().context("pipeline bus")?;
@@ -166,9 +166,14 @@ impl GifSession {
             }
         });
 
+        // Wait for either a stop signal (UI's Stop button or CLI's
+        // duration/ctrl_c task) or a fatal bus error. Previously this had a
+        // bare sleep(duration_secs) timeout, which meant the GUI's gif mode
+        // couldn't be stopped by the user — and a default `duration_secs: 0`
+        // made the gif finish instantly with no frames.
         let run_result: Result<()> = tokio::select! {
             err = err_rx.recv() => Err(err.unwrap_or_else(|| anyhow::anyhow!("bus channel closed"))),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(duration_secs)) => Ok(()),
+            _ = stop => Ok(()),
         };
 
         self.pipeline.send_event(gstreamer::event::Eos::new());

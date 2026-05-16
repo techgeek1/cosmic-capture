@@ -960,14 +960,17 @@ impl Panel {
                     match self.record_format {
                         RecordFormat::Gif => {
                             let args = self.build_gif_args();
-                            self.capture = CaptureState::Recording { stop_tx: None };
+                            let (stop_tx, stop_rx) = oneshot::channel();
+                            self.capture = CaptureState::Recording {
+                                stop_tx: Some(stop_tx),
+                            };
                             self.recording_started_at = Some(std::time::Instant::now());
                             Task::batch([
                                 close_bars,
                                 stop_pill,
                                 swap,
                                 release_kb,
-                                Task::perform(run_gif(args, crop), |r| {
+                                Task::perform(run_gif(args, crop, stop_rx), |r| {
                                     cosmic::action::app(Msg::GifFinished(r))
                                 }),
                             ])
@@ -1437,8 +1440,10 @@ fn record_button<'a>(
     let alpha = if enabled { 1.0 } else { 0.35 };
     let red = Color::from_rgba(0.93, 0.20, 0.20, alpha);
 
-    let inner_size = if recording { 14.0 } else { 18.0 };
-    let inner_radius: f32 = if recording { 3.0 } else { inner_size / 2.0 };
+    // Idle = full circle (red dot ready-to-record); recording = a chunkier,
+    // distinctly-square red block so it reads as the universal "stop" glyph.
+    let inner_size = if recording { 16.0 } else { 18.0 };
+    let inner_radius: f32 = if recording { 2.0 } else { inner_size / 2.0 };
     let inner = container(iced::widget::Space::new())
         .width(Length::Fixed(inner_size))
         .height(Length::Fixed(inner_size))
@@ -1490,8 +1495,12 @@ async fn run_record(
         .map(path_to_string)
         .map_err(|e| e.to_string())
 }
-async fn run_gif(args: GifArgs, crop: Option<CropRect>) -> Result<String, String> {
-    pipeline::gif::gif_with_crop(args, crop)
+async fn run_gif(
+    args: GifArgs,
+    crop: Option<CropRect>,
+    stop_rx: oneshot::Receiver<()>,
+) -> Result<String, String> {
+    pipeline::gif::gif_with_crop(args, crop, stop_rx)
         .await
         .map(path_to_string)
         .map_err(|e| e.to_string())

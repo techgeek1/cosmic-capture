@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use tokio::sync::oneshot;
 
 use crate::capture::screencast;
 use crate::cli::GifArgs;
@@ -12,6 +13,7 @@ use crate::{notify, paths};
 pub async fn gif_with_crop(
     args: GifArgs,
     crop: Option<CropRect>,
+    stop_rx: oneshot::Receiver<()>,
 ) -> Result<PathBuf> {
     let stream = screencast::start(args.cursor).await?;
     tracing::info!(node = stream.node_id, size = ?stream.size, "ScreenCast started (gif)");
@@ -25,7 +27,7 @@ pub async fn gif_with_crop(
         args.max_width,
         crop,
     )?;
-    session.run(args.duration_secs).await?;
+    session.run(stop_rx).await?;
 
     if args.common.notify {
         if let Err(e) = notify::saved(&path, "GIF").await {
@@ -57,7 +59,21 @@ pub async fn run(args: GifArgs) -> Result<()> {
         }
     };
 
-    let path = gif_with_crop(args, crop).await?;
+    // CLI path: bound the recording by either the requested duration or a
+    // Ctrl-C. Send the stop signal from a sidecar task so the gif session
+    // sees a clean stop event identical to the GUI's path.
+    let (stop_tx, stop_rx) = oneshot::channel::<()>();
+    let dur = args.duration_secs;
+    let stopper = tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(dur)) => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+        let _ = stop_tx.send(());
+    });
+
+    let path = gif_with_crop(args, crop, stop_rx).await?;
+    let _ = stopper.await;
     drop(_overlay);
 
     println!("{}", path.display());
