@@ -1,0 +1,72 @@
+[package]
+name = "cosmic-capture"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Unified screenshot, video, and GIF capture for the COSMIC desktop"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/techgeek1/cosmic-capture"
+
+[[bin]]
+name = "cosmic-capture"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Errors / logging
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "fs", "time"] }
+futures-util = "0.3"
+
+# xdg-desktop-portal client (Screenshot + ScreenCast)
+ashpd = { version = "0.12", default-features = false, features = ["tokio"] }
+
+# Wayland layer-shell overlay for the region selector (B path)
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop", "xkbcommon"] }
+rustix = { version = "0.38", features = ["event"] }
+
+# COSMIC theme — used to pull the user's accent color for the selector border.
+cosmic-config = { git = "https://github.com/pop-os/libcosmic" }
+cosmic-theme = { git = "https://github.com/pop-os/libcosmic" }
+
+# COSMIC GUI toolkit — for the pre-flight panel / HUD.
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = ["tokio", "wayland", "winit", "single-instance", "wgpu", "multi-window", "desktop"] }
+
+# GStreamer pipeline: pipewiresrc + encoders + appsink
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+
+# GIF encoding
+gifski = { version = "1.32", default-features = false }
+imgref = "1.10"
+rgb = "0.8"
+
+# Notifications
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+# Misc
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dirs = "5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = "none"

@@ -1,0 +1,6 @@
+/target
+Cargo.lock.user
+*.swp
+*.swo
+.envrc
+.direnv/
