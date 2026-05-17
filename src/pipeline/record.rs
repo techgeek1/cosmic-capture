@@ -18,6 +18,13 @@ pub async fn record_with_crop(
     crop: Option<CropRect>,
     stop_rx: oneshot::Receiver<()>,
 ) -> Result<PathBuf> {
+    tracing::info!(
+        container = ?args.container,
+        fps = args.fps,
+        encoder = ?args.encoder,
+        ?crop,
+        "record_with_crop: entering screencast start"
+    );
     let stream = screencast::start(args.cursor).await?;
     tracing::info!(
         node = stream.node_id,

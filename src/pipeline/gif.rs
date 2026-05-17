@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tokio::sync::oneshot;
 
-use crate::capture::screencast;
+use crate::capture::{pipewire_capture, screencast};
 use crate::cli::GifArgs;
 use crate::encode::gif::GifSession;
 use crate::encode::video::CropRect;
@@ -18,16 +18,27 @@ pub async fn gif_with_crop(
     let stream = screencast::start(args.cursor).await?;
     tracing::info!(node = stream.node_id, size = ?stream.size, "ScreenCast started (gif)");
 
+    // Same direct-libpipewire path as the record flow — bypasses
+    // gst-plugin-pipewire's pwsrc caps-fixed assertion.
+    let (capture, fmt_rx, frame_rx) =
+        pipewire_capture::start(stream.fd, stream.node_id)?;
+    let format = tokio::time::timeout(std::time::Duration::from_secs(5), fmt_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("pipewire stream did not negotiate format within 5s (gif)"))?
+        .map_err(|_| anyhow::anyhow!("pipewire capture thread dropped before format arrived (gif)"))?;
+    tracing::info!(?format, "pipewire format ready, building gif pipeline");
+
     let path = paths::resolve(args.common.file.clone(), paths::Kind::Image, "gif")?;
     let session = GifSession::build(
-        stream,
+        capture,
+        format,
         &path,
         args.fps,
         args.quality,
         args.max_width,
         crop,
     )?;
-    session.run(stop_rx).await?;
+    session.run(stop_rx, frame_rx).await?;
 
     if args.common.notify {
         if let Err(e) = notify::saved(&path, "GIF").await {

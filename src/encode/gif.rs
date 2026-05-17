@@ -1,9 +1,16 @@
 //! GIF encoding fed by a GStreamer `appsink` on RGBA samples.
 //!
+//! Mirrors the video pipeline architecture: instead of `pipewiresrc`, the
+//! source is a gst `appsrc` fed by [`crate::capture::pipewire_capture`].
+//! That avoids gst-plugin-pipewire's `gst_caps_is_fixed (pwsrc->caps)`
+//! assertion under cosmic-comp and gives us a single capture consumer that
+//! both video and gif paths share.
+//!
 //! gifski runs the encode on its own threads; we feed RGBA + PTS through
 //! a `Collector`, then a writer thread drains the encoder to disk.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -11,24 +18,28 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use gifski::{Repeat, Settings};
 use gstreamer::prelude::*;
-use gstreamer::{MessageView, Pipeline, State};
-use gstreamer_app::AppSink;
+use gstreamer::{Buffer, ClockTime, MessageView, Pipeline, State};
+use gstreamer_app::{AppSink, AppSrc};
 use gstreamer_video::VideoInfo;
 
-use crate::capture::screencast::PipeWireStream;
+use crate::capture::pipewire_capture::{gst_format_name, Capture as PwCapture, Frame, StreamFormat};
 use crate::encode::video::{build_crop_str, CropRect};
 
 pub struct GifSession {
     pipeline: Pipeline,
+    appsrc: AppSrc,
     writer_thread: std::thread::JoinHandle<Result<()>>,
     collector: Arc<Mutex<Option<gifski::Collector>>>,
     frame_counter: Arc<AtomicUsize>,
-    _stream: PipeWireStream,
+    /// Keeps the pipewire consumer thread alive for the recording's
+    /// duration; drop on session teardown closes it.
+    _pw_capture: PwCapture,
 }
 
 impl GifSession {
     pub fn build(
-        stream: PipeWireStream,
+        pw_capture: PwCapture,
+        format: StreamFormat,
         output: &Path,
         fps: u32,
         quality: u8,
@@ -37,9 +48,6 @@ impl GifSession {
     ) -> Result<Self> {
         gstreamer::init().context("gstreamer init")?;
 
-        // We can't know exact dimensions until the first sample, so the
-        // gifski Settings leave width/height unset (None) — gifski uses
-        // the first frame's natural size.
         let settings = Settings {
             width: None,
             height: None,
@@ -62,23 +70,32 @@ impl GifSession {
 
         let collector = Arc::new(Mutex::new(Some(collector)));
 
-        // pipewiresrc → videorate(fps) → optional crop → optional videoscale → RGBA → appsink
-        let crop_str = build_crop_str(crop, stream.size);
-        let scale = if max_width > 0 {
-            format!("videoscale ! video/x-raw,width=(int){max_width},pixel-aspect-ratio=1/1 !")
-        } else {
-            String::new()
-        };
+        // appsrc → queue → videorate → optional crop → videoconvert → videoscale
+        //        → single terminal capsfilter → appsink.
+        //
+        // Earlier shape chained two caps filters (`! video/x-raw,width=… !
+        // video/x-raw,format=RGBA`) and used the `(int)800` type annotation.
+        // That tripped gst-launch's tokenizer into looking up "video" as an
+        // element factory ("no element 'video'") because the parenthesised
+        // typed value confused the comma-token scanner. Collapsing every
+        // negotiation into one terminal caps filter sidesteps it.
+        let crop_str = build_crop_str(crop, Some((format.width, format.height)));
+        let mut filters = vec![
+            "format=RGBA".to_string(),
+            format!("framerate={fps}/1"),
+        ];
+        if max_width > 0 {
+            filters.push(format!("width={max_width}"));
+        }
+        let out_caps = format!("video/x-raw,{}", filters.join(","));
         let pipeline_str = format!(
-            "pipewiresrc fd={fd} path={node} do-timestamp=true keepalive-time=1000 \
-             ! videorate ! video/x-raw,framerate={fps}/1 \
-             {crop_str}\
-             ! videoconvert \
-             ! {scale} \
-             video/x-raw,format=RGBA \
+            "appsrc name=src is-live=true format=time do-timestamp=true \
+             ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
+             ! videorate drop-only=true max-rate={fps} \
+             {crop_str}! videoconvert \
+             ! videoscale \
+             ! {out_caps} \
              ! appsink name=sink emit-signals=true max-buffers=8 drop=false sync=false",
-            fd = stream.raw_fd(),
-            node = stream.node_id,
         );
         tracing::info!(%pipeline_str, "constructing gst gif pipeline");
 
@@ -88,9 +105,30 @@ impl GifSession {
             .downcast::<Pipeline>()
             .map_err(|_| anyhow::anyhow!("parse_launch did not return a Pipeline"))?;
 
+        let appsrc = pipeline
+            .by_name("src")
+            .ok_or_else(|| anyhow::anyhow!("appsrc 'src' missing from gif pipeline"))?
+            .dynamic_cast::<AppSrc>()
+            .map_err(|_| anyhow::anyhow!("'src' element is not an AppSrc"))?;
+
+        // Same defense-in-depth caps setup as video.rs: declare the fixed
+        // format we negotiated with the compositor so videorate/videocrop
+        // downstream can pick valid filters.
+        let gst_fmt = gst_format_name(format.format);
+        let caps_str = format!(
+            "video/x-raw,format={gst_fmt},width={src_w},height={src_h},framerate={src_fps}/1",
+            src_w = format.width,
+            src_h = format.height,
+            src_fps = format.fps.max(1),
+        );
+        let caps = gstreamer::Caps::from_str(&caps_str)
+            .with_context(|| format!("parse gif appsrc caps {caps_str:?}"))?;
+        appsrc.set_caps(Some(&caps));
+        tracing::info!(%caps_str, "gif appsrc caps set via API");
+
         let appsink = pipeline
             .by_name("sink")
-            .context("appsink not found")?
+            .context("appsink not found in gif pipeline")?
             .downcast::<AppSink>()
             .map_err(|_| anyhow::anyhow!("sink element is not AppSink"))?;
 
@@ -138,15 +176,73 @@ impl GifSession {
 
         Ok(Self {
             pipeline,
+            appsrc,
             writer_thread,
             collector,
             frame_counter,
-            _stream: stream,
+            _pw_capture: pw_capture,
         })
     }
 
-    pub async fn run(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
-        self.pipeline.set_state(State::Playing).context("pipeline → Playing")?;
+    pub async fn run(
+        self,
+        stop: tokio::sync::oneshot::Receiver<()>,
+        mut frame_rx: tokio::sync::mpsc::Receiver<Frame>,
+    ) -> Result<()> {
+        // Frame pump — mirrors VideoSession::run. Yields between buffers so
+        // a heavy gifski quantize pass on the appsink thread doesn't starve
+        // anything else. Stops when frame_rx closes.
+        let appsrc = self.appsrc.clone();
+        let _pump_handle = tokio::spawn(async move {
+            let start = Instant::now();
+            while let Some(frame) = frame_rx.recv().await {
+                let mut buf = Buffer::with_size(frame.bytes.len()).expect("alloc gst buffer");
+                {
+                    let buf_mut = buf.get_mut().expect("fresh buffer is unique");
+                    let mut map = buf_mut.map_writable().expect("map writable");
+                    map.copy_from_slice(&frame.bytes);
+                    drop(map);
+                    let elapsed = start.elapsed().as_nanos() as u64;
+                    buf_mut.set_pts(ClockTime::from_nseconds(elapsed));
+                }
+                if let Err(e) = appsrc.push_buffer(buf) {
+                    // "Pad is flushing" is the normal race between the pump
+                    // task and the EOS we send on Stop — the appsrc has
+                    // already been told to flush by the time the next
+                    // pipewire frame arrives. Anything else is a real
+                    // problem worth surfacing.
+                    if matches!(e, gstreamer::FlowError::Flushing) {
+                        tracing::debug!("gif pump stopping: appsrc flushed (normal on Stop)");
+                    } else {
+                        tracing::warn!(error = %e,
+                            "gif appsrc push_buffer failed; stopping pump");
+                    }
+                    break;
+                }
+            }
+            let _ = appsrc.end_of_stream();
+            tracing::info!("gif frame pump exited");
+        });
+
+        // set_state on a blocking thread w/ timeout, identical to video.rs
+        // — pipewiresrc is gone from gif now, but a heavy hardware encoder
+        // probe inside gst can still block for a noticeable fraction of a
+        // second on first use.
+        let pipeline_for_start = self.pipeline.clone();
+        let state_call = tokio::task::spawn_blocking(move || {
+            pipeline_for_start.set_state(State::Playing)
+        });
+        let state_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            state_call,
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => anyhow::bail!("gif set_state(Playing) task panicked: {e}"),
+            Err(_) => anyhow::bail!("gif pipeline failed to start within 3s"),
+        };
+        state_result.context("gif pipeline → Playing")?;
 
         let bus = self.pipeline.bus().context("pipeline bus")?;
         let (err_tx, mut err_rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
@@ -166,21 +262,25 @@ impl GifSession {
             }
         });
 
-        // Wait for either a stop signal (UI's Stop button or CLI's
-        // duration/ctrl_c task) or a fatal bus error. Previously this had a
-        // bare sleep(duration_secs) timeout, which meant the GUI's gif mode
-        // couldn't be stopped by the user — and a default `duration_secs: 0`
-        // made the gif finish instantly with no frames.
+        // Stop on either the user-initiated stop signal or a fatal bus error.
         let run_result: Result<()> = tokio::select! {
             err = err_rx.recv() => Err(err.unwrap_or_else(|| anyhow::anyhow!("bus channel closed"))),
             _ = stop => Ok(()),
         };
 
-        self.pipeline.send_event(gstreamer::event::Eos::new());
-        self.pipeline.set_state(State::Null).context("pipeline → Null")?;
+        // Drive the pipeline to EOS via the appsrc, then drain the bus.
+        let _ = self.appsrc.end_of_stream();
+        // Bounded shutdown — Null transition can also block if downstream
+        // muxer is mid-write; same blocking-thread trick.
+        let pipeline_for_stop = self.pipeline.clone();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || pipeline_for_stop.set_state(State::Null)),
+        )
+        .await;
         let _ = bus_thread.join();
 
-        // Drop the collector to signal the writer thread to finalize.
+        // Closing the collector signals the writer thread to finalize.
         drop(self.collector.lock().unwrap().take());
         let frames = self.frame_counter.load(Ordering::Relaxed);
         tracing::info!(frames, "gifski collector closed");

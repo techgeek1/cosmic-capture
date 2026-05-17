@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -30,13 +31,14 @@ use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
     IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
 };
 use cosmic::iced::{
-    self, Background, Border, Color, Length, Limits, Subscription, event, keyboard, window,
+    self, Background, Border, Color, Length, Limits, Subscription, event, keyboard, mouse, window,
 };
 use cosmic::widget::{button, container, dropdown, icon, row};
 use cosmic::{Application, Element, executor};
 use tokio::sync::oneshot;
 use wayland_client::protocol::wl_output::WlOutput;
 
+use crate::capture::screencopy::{self, CapturedFrame};
 use crate::cli::{CommonArgs, GifArgs, RecordArgs, VideoContainer, VideoEncoder};
 use crate::encode::video::CropRect;
 use crate::pipeline;
@@ -206,6 +208,16 @@ struct OutputInfo {
     /// Pointer-transparent recording-border surface, opened only while
     /// recording is in progress.
     recording_id: Option<window::Id>,
+    /// Frame captured at toolbar-open time, shared with the screenshot save
+    /// path. `Some` means the freeze succeeded; `None` means we haven't
+    /// captured yet (or capture failed). Cached as Arc so the iced image
+    /// handle and the save path can both reference the same bytes without
+    /// cloning the pixels.
+    frozen: Option<Arc<CapturedFrame>>,
+    /// Pre-built iced handle for `frozen`. Cached because building it
+    /// involves a stride-repack copy that we don't want to redo every
+    /// frame.
+    frozen_handle: Option<cosmic::iced::widget::image::Handle>,
 }
 
 pub struct Panel {
@@ -229,10 +241,6 @@ pub struct Panel {
     clipboard: bool,
 
     outputs: HashMap<u32, OutputInfo>,
-    /// Toplevels available for `Source::Window` capture. Refreshed when the
-    /// user enters Window mode (cosmic-protocols' toplevel_info doesn't
-    /// stream from a long-lived connection here yet — see capture::toplevels).
-    toplevels: Vec<crate::capture::toplevels::ToplevelSummary>,
     region: Option<SelectionRect>,
     /// Active drag session lifted out of the widget so every per-output
     /// instance computes new rect coords from the same anchor + start_rect.
@@ -257,6 +265,12 @@ pub struct Panel {
     /// the *Finished message handler reads this flag and deletes the
     /// pipeline's output instead of presenting it.
     cancel_pending: bool,
+    /// Toolbar surface the pointer is currently over, if any. Drives the
+    /// Source::Screen border so only the display the user is actually on
+    /// gets highlighted — multi-monitor users were seeing every output
+    /// flash a border at once, which obscured the "which one am I about
+    /// to capture" affordance the border is supposed to provide.
+    hovered_toolbar: Option<window::Id>,
 }
 
 #[derive(Clone, Debug)]
@@ -272,26 +286,30 @@ pub enum Msg {
     CancelSelection,
     EscPressed,
 
-    /// Toplevel enumeration finished. `Vec` may be empty if cosmic-comp
-    /// doesn't advertise `ext_foreign_toplevel_list_v1` or the user has no
-    /// windows open. Errors are logged and the list is left empty.
-    ToplevelsLoaded(Vec<crate::capture::toplevels::ToplevelSummary>),
-    /// User picked a specific window — pulls the identifier from the toplevel
-    /// snapshot and kicks the screenshot pipeline at it.
-    CaptureToplevel(String),
-
     /// Periodic tick during recording, fired by an `iced::time::every`
     /// subscription so the elapsed-time label on the stop pill keeps moving.
     Tick,
 
     ToggleClipboard,
 
-    PrimaryAction,
+    /// Trigger the main action (capture / start recording / stop recording).
+    /// The optional output name carries the toolbar surface the click came
+    /// from, so Source::Screen targets the display you actually clicked
+    /// instead of an arbitrary one from the output map.
+    PrimaryAction(Option<String>),
     RecordingFinished(Result<String, String>),
     GifFinished(Result<String, String>),
     ScreenshotFinished(Result<String, String>),
 
     Output(OutputEvent, WlOutput),
+    /// Pointer entered or left a toolbar surface. Tracked per-window so we
+    /// can highlight only the display the user is currently on.
+    PointerOn(Option<window::Id>),
+    /// Background capture for an output finished. Carries the output key
+    /// (HashMap index, not name) and the result. The toolbar layer surface
+    /// is opened only after this fires, so the captured frame doesn't
+    /// contain our own toolbar pill.
+    FrozenFrameReady(u32, std::result::Result<Arc<CapturedFrame>, String>),
     Quit,
 }
 
@@ -324,7 +342,6 @@ impl Application for Panel {
             notify: true,
             clipboard: false,
             outputs: HashMap::new(),
-            toplevels: Vec::new(),
             region: settings.last_region,
             drag: None,
             stop_pill_id: None,
@@ -332,6 +349,7 @@ impl Application for Panel {
             recording_started_at: None,
             saving_started_at: None,
             cancel_pending: false,
+            hovered_toolbar: None,
         };
 
         // No toolbar surface yet — we wait for OutputEvent::Created and open
@@ -353,12 +371,6 @@ impl Application for Panel {
                 if !self.locked() && self.source != s {
                     self.source = s;
                     self.persist("source", &s);
-                    if matches!(s, Source::Window) {
-                        // Kick off a fresh toplevel enumeration.
-                        return Task::perform(load_toplevels(), |list| {
-                            cosmic::action::app(Msg::ToplevelsLoaded(list))
-                        });
-                    }
                 }
             }
             Msg::ToggleClipboard => self.clipboard = !self.clipboard,
@@ -399,6 +411,7 @@ impl Application for Panel {
                             .map(|(w, h)| (w as u32, h as u32))
                             .unwrap_or((0, 0));
                         let scale = info.scale_factor;
+                        let name_for_capture = name.clone();
                         self.outputs.insert(
                             key,
                             OutputInfo {
@@ -409,6 +422,8 @@ impl Application for Panel {
                                 scale,
                                 toolbar_id: None,
                                 recording_id: None,
+                                frozen: None,
+                                frozen_handle: None,
                             },
                         );
                         // First time we have any geometry, validate the
@@ -416,7 +431,21 @@ impl Application for Panel {
                         // gone, drop it so the user doesn't see a phantom
                         // rect pointing into empty space.
                         self.prune_stale_region();
-                        return self.ensure_toolbar_for(key);
+                        // Open the toolbar AND kick off a freeze capture in
+                        // parallel. Capturing first and opening after would
+                        // give a 50–100ms blank gap where the live screen
+                        // is visible with no toolbar; opening first means
+                        // the captured frame may briefly include our own
+                        // (transparent-except-for-pill) surface, but iced
+                        // typically hasn't committed its first frame by
+                        // the time screencopy grabs the buffer.
+                        let with_cursor = self.rec_cursor;
+                        let open = self.ensure_toolbar_for(key);
+                        let freeze = Task::perform(
+                            capture_output(name_for_capture, with_cursor),
+                            move |r| cosmic::action::app(Msg::FrozenFrameReady(key, r)),
+                        );
+                        return Task::batch([open, freeze]);
                     }
                     OutputEvent::Created(None) => {}
                     OutputEvent::InfoUpdate(info) => {
@@ -481,10 +510,6 @@ impl Application for Panel {
                 self.persist("last_region", &Option::<SelectionRect>::None);
             }
 
-            Msg::ToplevelsLoaded(list) => {
-                tracing::debug!(count = list.len(), "toplevels loaded");
-                self.toplevels = list;
-            }
             Msg::Tick => {
                 // While Saving, watch for a hung pipeline (e.g. gst stuck
                 // on EOS after the pwsrc caps assertion) and force a
@@ -507,23 +532,13 @@ impl Application for Panel {
                 // triggers a re-render so view_stop_pill picks up a fresh
                 // elapsed time.
             }
-            Msg::CaptureToplevel(identifier) => {
-                if !matches!(self.capture, CaptureState::Idle) {
-                    return Task::none();
-                }
-                let destination = self.current_destination();
-                let notify_user = self.notify;
-                let cursor = self.rec_cursor;
-                self.capture = CaptureState::Saving;
-                return Task::perform(
-                    run_toplevel_screenshot(identifier, cursor, destination, notify_user),
-                    |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+            Msg::PrimaryAction(clicked_output) => {
+                tracing::info!(
+                    state = ?self.capture,
+                    clicked_output = ?clicked_output,
+                    "Msg::PrimaryAction"
                 );
-            }
-
-            Msg::PrimaryAction => {
-                tracing::info!(state = ?self.capture, "Msg::PrimaryAction");
-                return self.on_primary_action();
+                return self.on_primary_action(clicked_output);
             }
             Msg::EscPressed => match &mut self.capture {
                 CaptureState::Recording { stop_tx } => {
@@ -588,7 +603,11 @@ impl Application for Panel {
                         match std::fs::read(&path) {
                             Ok(bytes) => {
                                 if let Err(e) =
-                                    pipeline::screenshot::copy_bytes_to_clipboard(bytes, mime)
+                                    pipeline::screenshot::copy_bytes_with_uri_to_clipboard(
+                                        bytes,
+                                        mime,
+                                        path.clone(),
+                                    )
                                 {
                                     tracing::warn!(error = %e,
                                         "failed to copy recording to clipboard");
@@ -602,6 +621,35 @@ impl Application for Panel {
                     }
                 }
                 return self.shutdown();
+            }
+
+            Msg::FrozenFrameReady(key, result) => {
+                let Some(info) = self.outputs.get_mut(&key) else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(frame) => {
+                        let handle = frame_to_image_handle(&frame);
+                        info.frozen = Some(frame);
+                        info.frozen_handle = Some(handle);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e,
+                            "freeze capture failed; toolbar will run live-screen");
+                    }
+                }
+            }
+
+            Msg::PointerOn(id) => {
+                // Only accept hover transitions that name an actual toolbar
+                // surface — random window ids (stop pill, recording overlay)
+                // shouldn't suppress the border on the toolbar the user is
+                // on. `None` clears.
+                self.hovered_toolbar = id.filter(|id| {
+                    self.outputs
+                        .values()
+                        .any(|o| o.toolbar_id == Some(*id))
+                });
             }
 
             Msg::Quit => {
@@ -670,9 +718,24 @@ impl Application for Panel {
                 // iced translates `XK_space` to `Key::Character(" ")`, so
                 // match that here (Named::Space is the cross-platform form
                 // some other backends emit).
-                Key::Character(s) if s.as_str() == " " => Some(Msg::PrimaryAction),
+                Key::Character(s) if s.as_str() == " " => Some(Msg::PrimaryAction(None)),
                 _ => None,
             },
+            _ => None,
+        });
+        // Pointer enter/exit per toolbar surface. iced's `listen_with`
+        // surfaces a window id alongside each event; we use that to track
+        // which output's toolbar the pointer is on so Source::Screen can
+        // highlight only that display. CursorMoved as a fallback covers the
+        // case where the pointer was already inside the surface at
+        // subscription start (no Entered event ever fires in that case).
+        let pointer = event::listen_with(|e, _, id| match e {
+            iced::Event::Mouse(mouse::Event::CursorEntered)
+            | iced::Event::Mouse(mouse::Event::CursorMoved { .. })
+            | iced::Event::Mouse(mouse::Event::ButtonPressed(_)) => {
+                Some(Msg::PointerOn(Some(id)))
+            }
+            iced::Event::Mouse(mouse::Event::CursorLeft) => Some(Msg::PointerOn(None)),
             _ => None,
         });
         // Periodic tick during recording/saving so the elapsed-time label
@@ -687,7 +750,7 @@ impl Application for Panel {
         } else {
             Subscription::none()
         };
-        Subscription::batch([outputs, keys, tick])
+        Subscription::batch([outputs, keys, pointer, tick])
     }
 }
 
@@ -704,10 +767,11 @@ impl Panel {
             return false;
         }
         match (self.mode, self.source) {
-            // Screenshot+Window: captures fire from picker button clicks
-            // (Msg::CaptureToplevel). Toolbar's primary action stays
-            // inactive because there's no implicit "default window".
-            (Mode::Screenshot, Source::Window) => false,
+            // Screenshot+Window: clicking Capture invokes
+            // xdg-desktop-portal's interactive Screenshot UI (the same path
+            // cosmic-screenshot takes). The portal owns the window picker
+            // and freezes the screen while the user chooses, so we don't
+            // reimplement either of those client-side.
             (Mode::Screenshot, _) => true,
             // Record+Window: the screencast portal already advertises both
             // Monitor and Window source types — the user picks one in the
@@ -943,7 +1007,7 @@ impl Panel {
         }
     }
 
-    fn on_primary_action(&mut self) -> Task<Msg> {
+    fn on_primary_action(&mut self, clicked_output: Option<String>) -> Task<Msg> {
         match &mut self.capture {
             CaptureState::Recording { stop_tx, .. } => {
                 if let Some(tx) = stop_tx.take() {
@@ -968,7 +1032,29 @@ impl Panel {
             }
             CaptureState::Idle => match self.mode {
                 Mode::Screenshot => {
-                    let Some(output_name) = self.active_output_name() else {
+                    let destination = self.current_destination();
+                    let notify_user = self.notify;
+                    // Window source delegates to xdg-desktop-portal's
+                    // interactive Screenshot — same approach cosmic-screenshot
+                    // takes. The portal handles freeze + window picking.
+                    if matches!(self.source, Source::Window) {
+                        // Tear down our toolbar surfaces before the portal
+                        // dialog appears, otherwise its dim background
+                        // composites under our exclusive-keyboard layer
+                        // surfaces and the portal becomes uninteractive.
+                        let close_bars = self.close_toolbars();
+                        self.capture = CaptureState::Saving;
+                        self.saving_started_at = Some(std::time::Instant::now());
+                        return Task::batch([
+                            close_bars,
+                            Task::perform(
+                                run_portal_screenshot(destination, notify_user),
+                                |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+                            ),
+                        ]);
+                    }
+                    let Some(output_name) = self.active_output_name(clicked_output.as_deref())
+                    else {
                         tracing::warn!("no output detected; can't screenshot");
                         return Task::none();
                     };
@@ -976,25 +1062,30 @@ impl Panel {
                         Source::Region => self.crop_from_region(),
                         Source::Screen | Source::Window => None,
                     };
-                    let destination = match self.save_target {
-                        SaveTarget::Clipboard => pipeline::screenshot::Destination::Clipboard,
-                        SaveTarget::Pictures => pipeline::screenshot::Destination::File(None),
-                        SaveTarget::Documents => {
-                            let dest = dirs::document_dir().map(|d| {
-                                let stem = chrono::Local::now()
-                                    .format("cosmic-capture-%Y%m%d-%H%M%S");
-                                d.join(format!("{stem}.png"))
-                            });
-                            pipeline::screenshot::Destination::File(dest)
-                        }
-                    };
+                    // Prefer the frame captured at toolbar-open time so the
+                    // saved screenshot matches what the user is looking at
+                    // (the frozen background). If freeze hadn't completed
+                    // yet — Capture clicked before the capture task
+                    // returned — fall back to a fresh live screencopy.
+                    let frozen = self
+                        .outputs
+                        .values()
+                        .find(|o| o.name == output_name)
+                        .and_then(|o| o.frozen.as_ref())
+                        .map(|f| (**f).clone());
                     self.capture = CaptureState::Saving;
-                    let notify_user = self.notify;
                     let cursor = self.rec_cursor;
-                    Task::perform(
-                        run_screenshot(output_name, cursor, crop, destination, notify_user),
-                        |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
-                    )
+                    if let Some(frame) = frozen {
+                        Task::perform(
+                            run_save_frame(frame, crop, destination, notify_user),
+                            |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+                        )
+                    } else {
+                        Task::perform(
+                            run_screenshot(output_name, cursor, crop, destination, notify_user),
+                            |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+                        )
+                    }
                 }
                 Mode::Record => {
                     if !self.can_start() {
@@ -1054,69 +1145,6 @@ impl Panel {
         }
     }
 
-    /// Centered picker rendered when `Source::Window` is active. Each
-    /// toplevel becomes a button in a column; clicking it kicks off a
-    /// screencopy capture of that window.
-    ///
-    /// No thumbnails yet — this is title-only. Pre-capturing thumbnails per
-    /// toplevel needs a long-lived wayland connection that streams updates
-    /// into the GUI; that's a follow-up.
-    fn view_window_picker(&self) -> Element<'_, Msg> {
-        use cosmic::iced::widget::scrollable;
-
-        let mut col = iced::widget::column::with_capacity(self.toplevels.len().max(1))
-            .spacing(6)
-            .align_x(iced::Alignment::Center);
-        if self.toplevels.is_empty() {
-            col = col.push(
-                container(cosmic::widget::text::body("No windows available."))
-                    .padding(12),
-            );
-        } else {
-            for tl in &self.toplevels {
-                let label = if tl.title.is_empty() {
-                    if tl.app_id.is_empty() {
-                        tl.identifier.clone()
-                    } else {
-                        tl.app_id.clone()
-                    }
-                } else {
-                    tl.title.clone()
-                };
-                let id = tl.identifier.clone();
-                col = col.push(
-                    button::standard(label)
-                        .on_press(Msg::CaptureToplevel(id))
-                        .width(Length::Fixed(360.0)),
-                );
-            }
-        }
-
-        let inner = container(scrollable(col))
-            .padding(16)
-            .width(Length::Shrink)
-            .height(Length::Shrink)
-            .class(cosmic::theme::Container::Custom(Box::new(|theme| {
-                let t = theme.cosmic();
-                cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(t.background.component.base.into())),
-                    text_color: Some(t.background.component.on.into()),
-                    border: Border {
-                        radius: t.corner_radii.radius_s.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            })));
-
-        container(inner)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(iced::Alignment::Center)
-            .align_y(iced::Alignment::Center)
-            .into()
-    }
-
     /// Compact pill shown while a recording is in progress. Just the Stop
     /// button (which forwards to `PrimaryAction`) and a Quit icon for
     /// cancel-with-discard via the existing Esc path.
@@ -1129,7 +1157,7 @@ impl Panel {
         tracing::info!(state = ?self.capture, has_pill_id = self.stop_pill_id.is_some(),
             "rendering stop pill");
         let press_stop = matches!(self.capture, CaptureState::Recording { .. })
-            .then_some(Msg::PrimaryAction);
+            .then_some(Msg::PrimaryAction(None));
         let stop = record_button(&self.capture, press_stop.is_some(), press_stop);
         let cancel = button::icon(icon::from_name("window-close-symbolic"))
             .medium()
@@ -1237,7 +1265,10 @@ impl Panel {
             ActionKind::Normal => self.can_start()
                 || matches!(self.capture, CaptureState::Recording { .. }),
         };
-        let press = action_enabled.then_some(Msg::PrimaryAction);
+        // Carry the toolbar surface's output name with the click so
+        // Source::Screen captures whichever display the user actually
+        // pressed Capture on, not a HashMap-iteration-order fallback.
+        let press = action_enabled.then_some(Msg::PrimaryAction(Some(info.name.clone())));
         let action: Element<'_, Msg> = match self.mode {
             Mode::Record => record_button(&self.capture, action_enabled, press).into(),
             // Screenshot capture: grey "Capture" button (not suggested green).
@@ -1348,6 +1379,20 @@ impl Panel {
         let output_rect = output_rect_of(info);
         let mut stack = iced::widget::Stack::new();
 
+        // Frozen background — captured at toolbar-open time. Painted at the
+        // bottom of the stack so the selector + pill draw over it. While
+        // recording we suppress this (we want the live screen + recording
+        // border, not a stale frozen frame).
+        if pre_capture {
+            if let Some(handle) = info.frozen_handle.clone() {
+                let bg = cosmic::iced::widget::image(handle)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(cosmic::iced::ContentFit::Fill);
+                stack = stack.push(Element::from(bg));
+            }
+        }
+
         if pre_capture && matches!(self.source, Source::Region) {
             // view_toolbar is only invoked via the dispatch path that found
             // this id, so info.toolbar_id must be Some.
@@ -1366,18 +1411,30 @@ impl Panel {
         }
 
         if pre_capture && matches!(self.source, Source::Screen) {
-            stack = stack.push(fullscreen_border());
+            // Only paint the "you'll capture this monitor" border on the
+            // display the pointer is currently on. Without this every output
+            // shows a border simultaneously, which defeats the purpose.
+            // Fallback: if hover hasn't been established yet (initial frame
+            // before any pointer event), highlight the first output so the
+            // affordance isn't completely missing.
+            let is_hovered = self
+                .hovered_toolbar
+                .map(|h| Some(h) == info.toolbar_id)
+                .unwrap_or_else(|| {
+                    self.outputs
+                        .values()
+                        .find(|o| o.toolbar_id.is_some())
+                        .map_or(false, |o| o.toolbar_id == info.toolbar_id)
+                });
+            if is_hovered {
+                stack = stack.push(fullscreen_border());
+            }
         }
 
-        if pre_capture
-            && matches!(self.source, Source::Window)
-            && matches!(self.mode, Mode::Screenshot)
-        {
-            // Record-mode window capture is driven through the ScreenCast
-            // portal dialog (it already advertises Window as a source type),
-            // so we only render our own picker for screenshots.
-            stack = stack.push(self.view_window_picker());
-        }
+        // Window source no longer needs a client-side picker in either mode:
+        // Screenshot uses the xdg-desktop-portal interactive Screenshot
+        // (cosmic-screenshot pattern) and Record uses the ScreenCast portal.
+        // Both portals own the window picker themselves.
 
         stack.push(pill_layer).into()
     }
@@ -1425,7 +1482,30 @@ impl Panel {
             duration_secs: 0,
         }
     }
-    fn active_output_name(&self) -> Option<String> {
+    fn active_output_name(&self, override_: Option<&str>) -> Option<String> {
+        // Caller-provided override wins: the toolbar's `PrimaryAction(Some(name))`
+        // means "the user clicked Capture on this output's bar", which is the
+        // most direct signal of intent for Source::Screen. We still validate
+        // it against the current output set in case the display vanished
+        // between click and dispatch.
+        if let Some(name) = override_ {
+            if self.outputs.values().any(|o| o.name == name) {
+                return Some(name.to_string());
+            }
+        }
+        // Space-key path (override=None): use the toolbar surface the
+        // pointer currently sits on. Without this the keyboard hotkey would
+        // bind to a HashMap-iteration-order output that has nothing to do
+        // with where the user is actually looking.
+        if let Some(hover) = self.hovered_toolbar {
+            if let Some(info) = self
+                .outputs
+                .values()
+                .find(|o| o.toolbar_id == Some(hover))
+            {
+                return Some(info.name.clone());
+            }
+        }
         // Multi-output: pick whichever output the region's center sits on,
         // falling back to the first output if no region (Source::Screen).
         // This makes "capture this monitor" do the right thing whichever
@@ -1579,32 +1659,70 @@ async fn run_screenshot(
         .map(path_to_string)
         .map_err(|e| format!("{:#}", e))
 }
-async fn run_toplevel_screenshot(
-    identifier: String,
-    cursor: bool,
+async fn run_portal_screenshot(
     destination: pipeline::screenshot::Destination,
     notify_user: bool,
 ) -> Result<String, String> {
-    pipeline::screenshot::capture_toplevel(identifier, cursor, destination, notify_user)
+    pipeline::screenshot::capture_via_portal(destination, notify_user)
         .await
         .map(path_to_string)
         .map_err(|e| format!("{:#}", e))
 }
+async fn run_save_frame(
+    frame: CapturedFrame,
+    crop: Option<CropRect>,
+    destination: pipeline::screenshot::Destination,
+    notify_user: bool,
+) -> Result<String, String> {
+    pipeline::screenshot::save_frame(frame, crop, destination, notify_user)
+        .await
+        .map(path_to_string)
+        .map_err(|e| format!("{:#}", e))
+}
+/// Serialize freeze captures across outputs. Multiple `screencopy::capture`
+/// calls running in parallel each open their own wayland connection and
+/// allocate their own shm pool; in practice that mix has produced glibc
+/// heap corruption on multi-monitor setups, so we funnel everything
+/// through one slot. The Mutex is async (Tokio) so it doesn't block the
+/// main event loop while a capture is in flight.
+static FREEZE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Run toplevel enumeration on the blocking pool. Empty result on error so
-/// the caller doesn't need to thread a Result through the message enum.
-async fn load_toplevels() -> Vec<crate::capture::toplevels::ToplevelSummary> {
-    match tokio::task::spawn_blocking(crate::capture::toplevels::list).await {
-        Ok(Ok(list)) => list,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "toplevel enumeration failed");
-            Vec::new()
+async fn capture_output(
+    output_name: String,
+    with_cursor: bool,
+) -> std::result::Result<Arc<CapturedFrame>, String> {
+    let _guard = FREEZE_LOCK.lock().await;
+    let target = screencopy::Target::OutputName(output_name.clone());
+    tracing::info!(output = %output_name, "freeze: capturing output");
+    let result = tokio::task::spawn_blocking(move || screencopy::capture(target, with_cursor))
+        .await
+        .map_err(|e| format!("capture task join: {e}"))?
+        .map(Arc::new)
+        .map_err(|e| format!("{e:#}"));
+    tracing::info!(output = %output_name, ok = result.is_ok(), "freeze: capture done");
+    result
+}
+
+/// Repack a `CapturedFrame` (which may have row padding via `stride >
+/// width*4`) into a tightly packed RGBA buffer and wrap it in an iced
+/// image handle. The handle internally stores an `Arc<Bytes>`, so it's
+/// cheap to clone for every redraw.
+fn frame_to_image_handle(frame: &CapturedFrame) -> cosmic::iced::widget::image::Handle {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let s = frame.stride as usize;
+    let row_bytes = w * 4;
+    let buf = if s == row_bytes {
+        frame.pixels.clone()
+    } else {
+        let mut out = Vec::with_capacity(row_bytes * h);
+        for y in 0..h {
+            let off = y * s;
+            out.extend_from_slice(&frame.pixels[off..off + row_bytes]);
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "toplevel enumeration task join failed");
-            Vec::new()
-        }
-    }
+        out
+    };
+    cosmic::iced::widget::image::Handle::from_rgba(frame.width, frame.height, buf)
 }
 
 fn path_to_string(p: PathBuf) -> String {

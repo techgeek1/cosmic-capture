@@ -80,13 +80,21 @@ impl VideoSession {
     ) -> Result<Self> {
         gstreamer::init().context("gstreamer init")?;
 
-        let enc = encoder.resolve();
-        let (parser, muxer) = match container {
-            VideoContainer::Mp4 => ("h264parse", "mp4mux faststart=true"),
-            VideoContainer::Mkv => ("h264parse", "matroskamux"),
-            VideoContainer::WebM => {
-                anyhow::bail!("webm container needs vp8/vp9 encode; not wired yet")
-            }
+        // Container drives codec choice: H.264 for mp4/mkv, VP9/VP8 for webm.
+        // webmmux accepts vp8/vp9 streams directly, so the parser stage is
+        // skipped for WebM (h264parse / aacparse only apply to AVC).
+        let (enc, parser_chain, muxer) = match container {
+            VideoContainer::Mp4 => (
+                encoder.resolve(),
+                "h264parse !".to_string(),
+                "mp4mux faststart=true",
+            ),
+            VideoContainer::Mkv => (
+                encoder.resolve(),
+                "h264parse !".to_string(),
+                "matroskamux",
+            ),
+            VideoContainer::WebM => (resolve_webm_encoder(), String::new(), "webmmux"),
         };
 
         // Crop math uses the negotiated source dimensions now that we know
@@ -149,8 +157,8 @@ impl VideoSession {
              ! videoconvert \
              ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! {enc} \
-             ! {parser} \
-             ! {muxer} name=mux \
+             ! {parser_chain} \
+             {muxer} name=mux \
              ! filesink name=sink location={location} {audio}",
             audio = audio_branch,
         );
@@ -448,6 +456,42 @@ pub fn build_crop_str(crop: Option<CropRect>, source_size: Option<(u32, u32)>) -
         ),
         (None, _) => String::new(),
     }
+}
+
+/// Pick a webm-compatible encoder: hardware VAAPI when present, otherwise
+/// libvpx in realtime mode. vp8enc is preferred over vp9enc on CPU because
+/// vp9enc is essentially unusable for live screen capture.
+fn resolve_webm_encoder() -> String {
+    let has = |name: &str| ElementFactory::find(name).is_some();
+    if has("vavp9enc") {
+        return "vavp9enc".into();
+    }
+    if has("vavp9lpenc") {
+        return "vavp9lpenc".into();
+    }
+    if has("vavp8enc") {
+        return "vavp8enc".into();
+    }
+    if has("vp8enc") {
+        // deadline=1 (1µs budget) puts libvpx in realtime mode; cpu-used
+        // trades quality for speed (0=best/slowest, 16=fastest/lowest).
+        // 4 keeps frames sub-100ms on typical desktop CPUs.
+        tracing::warn!(
+            "no hardware VP encoder; falling back to libvpx vp8enc realtime — \
+             expect heavy CPU during recording"
+        );
+        return "vp8enc deadline=1 cpu-used=4 threads=4 target-bitrate=6000000".into();
+    }
+    if has("vp9enc") {
+        tracing::warn!(
+            "only libvpx vp9enc available; encoder is too slow for realtime \
+             screen capture and the recording will drop frames"
+        );
+        return "vp9enc deadline=1 cpu-used=8 threads=8 target-bitrate=6000000".into();
+    }
+    // Last-ditch — produce a string that will fail loudly in parse_launch
+    // with a discoverable element name rather than silently passing.
+    "vp8enc".into()
 }
 
 fn escape_for_gst(s: &str) -> String {

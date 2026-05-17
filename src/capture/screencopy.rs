@@ -30,11 +30,25 @@ use wayland_client::{
 /// Captured frame in compositor-native bytes (interpreted as RGBA8 after
 /// the format swap we perform in `ready`). `stride` may exceed `width * 4`
 /// if the compositor padded rows, so consumers should iterate row by row.
+#[derive(Clone)]
 pub struct CapturedFrame {
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
+}
+
+impl std::fmt::Debug for CapturedFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Skip the pixel buffer — including it would dump megabytes into
+        // every trace log.
+        f.debug_struct("CapturedFrame")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("stride", &self.stride)
+            .field("pixels_len", &self.pixels.len())
+            .finish()
+    }
 }
 
 /// Which output to capture. Either a specific output name (from

@@ -41,6 +41,12 @@ pub struct ClipboardServeArgs {
     /// MIME type to advertise for the clipboard contents.
     #[arg(long)]
     pub mime: String,
+    /// Optional filesystem path whose `file://` URI should also be
+    /// advertised under `text/uri-list`. Chat/upload-style targets paste
+    /// this MIME as a file attachment, while media-aware apps still pick
+    /// up the bytes under `mime`.
+    #[arg(long)]
+    pub uri_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]

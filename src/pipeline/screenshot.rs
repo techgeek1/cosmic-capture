@@ -82,6 +82,111 @@ pub async fn capture_with(
     }
 }
 
+/// GUI entry — save a pre-captured frame to the configured destination.
+/// Used by the "freeze on toolbar open" flow: the GUI captures each output
+/// the moment the toolbar appears, then hands the cached frame back here
+/// when the user clicks Capture. Without this the user would be selecting
+/// from a frozen image but the saved screenshot would be a fresh live
+/// frame — they wouldn't match.
+pub async fn save_frame(
+    frame: CapturedFrame,
+    crop: Option<CropRect>,
+    destination: Destination,
+    notify_user: bool,
+) -> Result<PathBuf> {
+    let crop = crop.map(|c| (c.x, c.y, c.w, c.h));
+    match destination {
+        Destination::Clipboard => {
+            encode_to_clipboard(&frame, crop).await?;
+            if notify_user {
+                let _ = notify::saved(std::path::Path::new("clipboard"), "Screenshot").await;
+            }
+            Ok(PathBuf::from("clipboard"))
+        }
+        Destination::File(user_path) => {
+            let dest = paths::resolve(user_path, paths::Kind::Image, "png")?;
+            encode_to_file(&frame, crop, &dest)?;
+            if notify_user {
+                if let Err(e) = notify::saved(&dest, "Screenshot").await {
+                    tracing::warn!(error = %e, "failed to send notification");
+                }
+            }
+            Ok(dest)
+        }
+    }
+}
+
+/// GUI entry — defer to xdg-desktop-portal's interactive Screenshot UI.
+/// Mirrors cosmic-screenshot's flow: the portal handles window/output/region
+/// picking and freezes the screen while the user chooses, so we don't have
+/// to reimplement that machinery on the client side.
+///
+/// The portal returns a `file://` URI pointing at a temp PNG it wrote. We
+/// either move that file to the user's destination or read it into the
+/// clipboard, depending on `destination`.
+pub async fn capture_via_portal(
+    destination: Destination,
+    notify_user: bool,
+) -> Result<PathBuf> {
+    use ashpd::desktop::screenshot::Screenshot;
+
+    let response = Screenshot::request()
+        .interactive(true)
+        .modal(true)
+        .send()
+        .await
+        .context("Screenshot portal send")?
+        .response()
+        .context("Screenshot portal response")?;
+    let uri = response.uri();
+    let src_path = match uri.scheme() {
+        "file" => uri
+            .to_file_path()
+            .map_err(|_| anyhow::anyhow!("portal returned non-local URI '{uri}'"))?,
+        scheme => anyhow::bail!("portal returned unsupported URI scheme '{scheme}'"),
+    };
+
+    match destination {
+        Destination::Clipboard => {
+            // Read the portal's temp PNG, drop the file, push bytes to the
+            // wayland clipboard. The portal's own temp lifetime is short, so
+            // we don't try to leave it behind.
+            let bytes =
+                fs::read(&src_path).with_context(|| format!("read {}", src_path.display()))?;
+            let _ = fs::remove_file(&src_path);
+            tokio::task::spawn_blocking(move || copy_bytes_to_clipboard(bytes, "image/png"))
+                .await
+                .map_err(|e| anyhow::anyhow!("clipboard task join: {e}"))??;
+            if notify_user {
+                let _ = notify::saved(std::path::Path::new("clipboard"), "Screenshot").await;
+            }
+            Ok(PathBuf::from("clipboard"))
+        }
+        Destination::File(user_path) => {
+            let dest = paths::resolve(user_path, paths::Kind::Image, "png")?;
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            // Same dev-vs-dev gymnastics as cosmic-screenshot: portal temp
+            // often lives in /tmp on a tmpfs while user picture dir is on
+            // disk, so rename across filesystems would EXDEV. Fall back to
+            // copy+remove in that case.
+            if let Err(e) = fs::rename(&src_path, &dest) {
+                tracing::debug!(error = %e, "rename failed, falling back to copy");
+                fs::copy(&src_path, &dest)
+                    .with_context(|| format!("copy {} → {}", src_path.display(), dest.display()))?;
+                let _ = fs::remove_file(&src_path);
+            }
+            if notify_user {
+                if let Err(e) = notify::saved(&dest, "Screenshot").await {
+                    tracing::warn!(error = %e, "failed to send notification");
+                }
+            }
+            Ok(dest)
+        }
+    }
+}
+
 /// GUI entry — per-window capture. `identifier` is the stable string from
 /// `ext_foreign_toplevel_list_v1`'s `identifier` event. Crop is unsupported
 /// (we hand back exactly what the compositor renders for the toplevel).
@@ -147,7 +252,18 @@ async fn encode_to_clipboard(
 /// Public so the GUI can stash a saved video's path on the clipboard after a
 /// successful recording.
 pub fn copy_bytes_to_clipboard(bytes: Vec<u8>, mime: &str) -> Result<()> {
-    copy_to_clipboard_impl(bytes, mime)
+    copy_to_clipboard_impl(bytes, mime, None)
+}
+
+/// Like [`copy_bytes_to_clipboard`] but also advertises `text/uri-list` with
+/// a `file://` URI pointing at `path`. Most chat / upload apps paste the URI
+/// rather than the bytes, so finished recordings benefit from offering both.
+pub fn copy_bytes_with_uri_to_clipboard(
+    bytes: Vec<u8>,
+    mime: &str,
+    path: std::path::PathBuf,
+) -> Result<()> {
+    copy_to_clipboard_impl(bytes, mime, Some(path))
 }
 
 /// Hand bytes off to a child `cosmic-capture __clipboard_serve` process.
@@ -160,15 +276,21 @@ pub fn copy_bytes_to_clipboard(bytes: Vec<u8>, mime: &str) -> Result<()> {
 /// A child process gets reparented to PID 1 when we exit, keeps holding the
 /// selection, and naturally terminates the next time something else claims
 /// the clipboard.
-fn copy_to_clipboard_impl(bytes: Vec<u8>, mime: &str) -> Result<()> {
+fn copy_to_clipboard_impl(
+    bytes: Vec<u8>,
+    mime: &str,
+    uri_path: Option<std::path::PathBuf>,
+) -> Result<()> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
     let me = std::env::current_exe().context("current_exe")?;
-    let mut child = Command::new(&me)
-        .arg("__clipboard_serve")
-        .arg("--mime")
-        .arg(mime)
+    let mut cmd = Command::new(&me);
+    cmd.arg("__clipboard_serve").arg("--mime").arg(mime);
+    if let Some(p) = &uri_path {
+        cmd.arg("--uri-path").arg(p);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -198,7 +320,7 @@ fn copy_to_clipboard_impl(bytes: Vec<u8>, mime: &str) -> Result<()> {
 /// `MimeType::Specific(...)`.
 pub fn serve_clipboard(args: ClipboardServeArgs) -> Result<()> {
     use std::io::Read;
-    use wl_clipboard_rs::copy::{MimeType, Options, ServeRequests, Source};
+    use wl_clipboard_rs::copy::{MimeSource, MimeType, Options, ServeRequests, Source};
 
     let mut bytes = Vec::new();
     std::io::stdin()
@@ -219,9 +341,29 @@ pub fn serve_clipboard(args: ClipboardServeArgs) -> Result<()> {
     // selection is taken away from us. Without it, prepare_copy panics.
     opts.foreground(true);
     opts.serve_requests(ServeRequests::Unlimited);
-    let prepared = opts
-        .prepare_copy(Source::Bytes(bytes.into_boxed_slice()), mime)
-        .map_err(|e| anyhow::anyhow!("wl-clipboard prepare_copy: {e}"))?;
+
+    let prepared = if let Some(path) = args.uri_path {
+        // Build a CRLF-terminated single-entry uri-list per RFC 2483; most
+        // wayland-side paste targets accept either CR or CRLF, but a few
+        // (notably some Chromium-based apps) are strict about CRLF.
+        let abs = path.canonicalize().unwrap_or(path);
+        let uri = format!("file://{}\r\n", abs.display());
+        let sources = vec![
+            MimeSource {
+                source: Source::Bytes(bytes.into_boxed_slice()),
+                mime_type: mime,
+            },
+            MimeSource {
+                source: Source::Bytes(uri.into_bytes().into_boxed_slice()),
+                mime_type: MimeType::Specific("text/uri-list".to_string()),
+            },
+        ];
+        opts.prepare_copy_multi(sources)
+            .map_err(|e| anyhow::anyhow!("wl-clipboard prepare_copy_multi: {e}"))?
+    } else {
+        opts.prepare_copy(Source::Bytes(bytes.into_boxed_slice()), mime)
+            .map_err(|e| anyhow::anyhow!("wl-clipboard prepare_copy: {e}"))?
+    };
     prepared
         .serve()
         .map_err(|e| anyhow::anyhow!("wl-clipboard serve: {e}"))?;
