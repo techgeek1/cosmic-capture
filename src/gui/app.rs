@@ -947,7 +947,20 @@ impl Panel {
         match &mut self.capture {
             CaptureState::Recording { stop_tx, .. } => {
                 if let Some(tx) = stop_tx.take() {
-                    let _ = tx.send(());
+                    match tx.send(()) {
+                        Ok(()) => tracing::info!(
+                            "stop_tx sent — VideoSession::run should now wake"
+                        ),
+                        Err(()) => tracing::warn!(
+                            "stop_tx send failed — receiver was dropped, \
+                             pipeline future already exited?"
+                        ),
+                    }
+                } else {
+                    tracing::warn!(
+                        "stop click but stop_tx is None — already sent? \
+                         or gif path forgot to wire one in?"
+                    );
                 }
                 self.capture = CaptureState::Saving;
                 self.saving_started_at = Some(std::time::Instant::now());

@@ -207,9 +207,12 @@ impl VideoSession {
     }
 
     pub async fn run(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
-        tracing::info!("pipeline: → Playing");
-        self.pipeline.set_state(State::Playing).context("pipeline → Playing")?;
+        tracing::info!("pipeline: → Playing (calling set_state)");
+        let state_result = self.pipeline.set_state(State::Playing);
+        tracing::info!(?state_result, "pipeline: set_state(Playing) returned");
+        state_result.context("pipeline → Playing")?;
         let bus = self.pipeline.bus().context("pipeline bus")?;
+        tracing::info!("pipeline: bus acquired, entering select loop");
 
         let (bus_tx, mut bus_rx) = tokio::sync::mpsc::unbounded_channel::<Result<()>>();
         let bus_thread = std::thread::spawn(move || {
@@ -248,7 +251,11 @@ impl VideoSession {
         });
 
         let result = tokio::select! {
-            r = bus_rx.recv() => r.unwrap_or(Ok(())),
+            r = bus_rx.recv() => {
+                tracing::info!(received = r.is_some(),
+                    "bus_rx branch fired — pipeline ended on its own");
+                r.unwrap_or(Ok(()))
+            }
             _ = stop => {
                 tracing::info!("stop signal received; sending EOS");
                 self.pipeline.send_event(gstreamer::event::Eos::new());
