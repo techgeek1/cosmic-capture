@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tokio::sync::oneshot;
 
+use crate::capture::pipewire_capture;
 use crate::capture::screencast;
 use crate::cli::RecordArgs;
 use crate::encode::video::{CropRect, VideoSession};
@@ -24,6 +25,17 @@ pub async fn record_with_crop(
         "ScreenCast started"
     );
 
+    // Hand the PipeWire fd off to our own consumer thread instead of
+    // gst-plugin-pipewire. The thread negotiates a fixed video format
+    // with the compositor, then streams raw frames to us via `frame_rx`.
+    let (capture, fmt_rx, frame_rx) =
+        pipewire_capture::start(stream.fd, stream.node_id)?;
+    let format = tokio::time::timeout(std::time::Duration::from_secs(5), fmt_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("pipewire stream did not negotiate format within 5s"))?
+        .map_err(|_| anyhow::anyhow!("pipewire capture thread dropped before format arrived"))?;
+    tracing::info!(?format, "pipewire format ready, building gst pipeline");
+
     let path = paths::resolve(
         args.common.file.clone(),
         paths::Kind::Video,
@@ -31,7 +43,8 @@ pub async fn record_with_crop(
     )?;
 
     let session = VideoSession::build(
-        stream,
+        capture,
+        format,
         &path,
         args.fps,
         args.container,
@@ -40,7 +53,7 @@ pub async fn record_with_crop(
         crop,
     )?;
 
-    session.run(stop_rx).await?;
+    session.run(stop_rx, frame_rx).await?;
 
     if args.common.notify {
         if let Err(e) = notify::saved(&path, "Recording").await {

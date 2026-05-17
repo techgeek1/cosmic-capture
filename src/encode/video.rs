@@ -1,14 +1,27 @@
-//! GStreamer video pipeline driven by a ScreenCast PipeWire stream.
+//! GStreamer video pipeline driven by an in-process PipeWire consumer.
+//!
+//! The recording pipeline starts with `appsrc name=src` rather than
+//! `pipewiresrc`. Our own [`crate::capture::pipewire_capture`] module
+//! consumes the screencast portal's PipeWire node, negotiates a fixed
+//! video format on the consumer side, and forwards each buffer's bytes
+//! through a tokio mpsc receiver; this module wraps those bytes in a
+//! gst `Buffer` and pushes them into the appsrc. The previous flow used
+//! gst-plugin-pipewire's `pipewiresrc`, which trips the
+//! `gst_caps_is_fixed (pwsrc->caps)` assertion against cosmic-comp's
+//! screencast on older plugin builds and wedges the pipeline before any
+//! frames flow.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use gstreamer::prelude::*;
-use gstreamer::{ElementFactory, MessageView, PadProbeReturn, PadProbeType, Pipeline, State};
+use gstreamer::{Buffer, ClockTime, ElementFactory, MessageView, PadProbeReturn, PadProbeType, Pipeline, State};
+use gstreamer_app::AppSrc;
 
-use crate::capture::screencast::PipeWireStream;
+use crate::capture::pipewire_capture::{Capture as PwCapture, Frame, StreamFormat, gst_format_name};
 use crate::cli::{VideoContainer, VideoEncoder};
 
 #[derive(Clone, Copy, Debug)]
@@ -45,14 +58,18 @@ impl CropRect {
 
 pub struct VideoSession {
     pipeline: Pipeline,
+    appsrc: AppSrc,
     frames_at_crop: Arc<AtomicU64>,
     bytes_at_sink: Arc<AtomicU64>,
-    _stream: PipeWireStream,
+    /// Hold the pipewire consumer alive for the duration of recording —
+    /// drop on session teardown stops the pipewire thread.
+    _pw_capture: PwCapture,
 }
 
 impl VideoSession {
     pub fn build(
-        stream: PipeWireStream,
+        pw_capture: PwCapture,
+        format: StreamFormat,
         output: &Path,
         fps: u32,
         container: VideoContainer,
@@ -71,14 +88,17 @@ impl VideoSession {
             }
         };
 
-        let crop_str = match (crop, stream.size) {
-            (Some(c), Some((w, h))) => {
-                let (t, l, r, b) = c.to_crop_props(w, h);
-                let out_w = w.saturating_sub(l + r);
-                let out_h = h.saturating_sub(t + b);
+        // Crop math uses the negotiated source dimensions now that we know
+        // them up front (vs. the old pipewiresrc path where we sometimes
+        // didn't have a size from the portal).
+        let crop_str = match crop {
+            Some(c) => {
+                let (t, l, r, b) = c.to_crop_props(format.width, format.height);
+                let out_w = format.width.saturating_sub(l + r);
+                let out_h = format.height.saturating_sub(t + b);
                 if out_w == 0 || out_h == 0 {
                     tracing::warn!(
-                        stream_w = w, stream_h = h, ?c,
+                        stream_w = format.width, stream_h = format.height, ?c,
                         "crop rect outside stream bounds; recording full source"
                     );
                     String::new()
@@ -91,7 +111,7 @@ impl VideoSession {
                         );
                     }
                     tracing::info!(
-                        stream_w = w, stream_h = h,
+                        stream_w = format.width, stream_h = format.height,
                         crop_top = t, crop_left = l, crop_right = r, crop_bottom = b,
                         out_w, out_h,
                         "videocrop applied"
@@ -99,22 +119,7 @@ impl VideoSession {
                     format!("! videocrop name=crop top={t} left={l} right={r} bottom={b} ")
                 }
             }
-            (Some(c), None) => {
-                tracing::warn!(
-                    ?c,
-                    "no source size from portal; cropping with right=bottom=0 + caps clamp"
-                );
-                // Force even dims at the caps filter.
-                let w = c.w & !1;
-                let h = c.h & !1;
-                format!(
-                    "! videocrop name=crop top={t} left={l} right=0 bottom=0 \
-                     ! video/x-raw,width={w},height={h} ",
-                    t = c.y.max(0),
-                    l = c.x.max(0),
-                )
-            }
-            (None, _) => String::new(),
+            None => String::new(),
         };
 
         let location = escape_for_gst(output.to_string_lossy().as_ref());
@@ -123,27 +128,15 @@ impl VideoSession {
         } else {
             ""
         };
-        // Pipeline shape, intentional details:
-        //  * `queue leaky=downstream` before the encoder — if the encoder
-        //    can't keep up we drop frames in real-time rather than building
-        //    a 30s post-stop backlog.
-        //  * `videorate drop-only=true max-rate={fps}` — without these,
-        //    videorate doesn't actually cap above-target rates (it only
-        //    duplicates upward), so a 240Hz pipewiresrc deluges the
-        //    encoder.
-        //  * `do-timestamp=true` on pipewiresrc uses our local clock so
-        //    videorate has monotonic timestamps to work with.
-        //  * Capsfilter `video/x-raw` right after pipewiresrc constrains
-        //    negotiation to raw video. Without it, cosmic-comp's screencast
-        //    advertises a parameter set that includes alternatives and
-        //    older gst-plugin-pipewire hits
-        //    `handle_format_change: assertion 'gst_caps_is_fixed (pwsrc->caps)'`
-        //    because the handler expects fixed caps. The downstream
-        //    capsfilter forces upstream negotiation to converge on a single
-        //    raw-video format before the assertion runs.
+        let gst_fmt = gst_format_name(format.format);
+        // `appsrc name=src` is fed from `pump_frames` below. is-live=true
+        // makes the source clock to wall-clock; format=time so we can stamp
+        // PTS on buffers (or omit them and let do-timestamp do its job).
+        // Caps are pre-fixed from the pipewire negotiation, so no caps
+        // assertion can wedge us mid-flight.
         let pipeline_str = format!(
-            "pipewiresrc fd={fd} path={node} do-timestamp=true keepalive-time=1000 \
-             ! video/x-raw \
+            "appsrc name=src is-live=true format=time do-timestamp=true \
+                  caps=video/x-raw,format={gst_fmt},width={src_w},height={src_h},framerate={src_fps}/1 \
              ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! videorate drop-only=true max-rate={fps} \
              ! video/x-raw,framerate={fps}/1 \
@@ -154,8 +147,9 @@ impl VideoSession {
              ! {parser} \
              ! {muxer} name=mux \
              ! filesink name=sink location={location} {audio}",
-            fd = stream.raw_fd(),
-            node = stream.node_id,
+            src_w = format.width,
+            src_h = format.height,
+            src_fps = format.fps.max(1),
             audio = audio_branch,
         );
         tracing::info!(%pipeline_str, "constructing gst pipeline");
@@ -164,6 +158,12 @@ impl VideoSession {
         let pipeline = element
             .downcast::<Pipeline>()
             .map_err(|_| anyhow::anyhow!("parse_launch did not return a Pipeline"))?;
+
+        let appsrc = pipeline
+            .by_name("src")
+            .ok_or_else(|| anyhow::anyhow!("appsrc 'src' missing from pipeline"))?
+            .dynamic_cast::<AppSrc>()
+            .map_err(|_| anyhow::anyhow!("'src' element is not an AppSrc"))?;
 
         if matches!(encoder, VideoEncoder::Auto)
             && ElementFactory::find("vaapih264enc").is_none()
@@ -203,10 +203,54 @@ impl VideoSession {
             }
         }
 
-        Ok(Self { pipeline, frames_at_crop, bytes_at_sink, _stream: stream })
+        Ok(Self {
+            pipeline,
+            appsrc,
+            frames_at_crop,
+            bytes_at_sink,
+            _pw_capture: pw_capture,
+        })
     }
 
-    pub async fn run(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
+    pub async fn run(
+        self,
+        stop: tokio::sync::oneshot::Receiver<()>,
+        mut frame_rx: tokio::sync::mpsc::Receiver<Frame>,
+    ) -> Result<()> {
+        // Frame pump: forward pipewire-side buffers into the gst appsrc.
+        // Runs on a tokio task that yields between buffers so it doesn't
+        // starve the rest of the runtime. Stops automatically when frame_rx
+        // closes (pipewire thread dropped or signalled stop).
+        let appsrc = self.appsrc.clone();
+        let _pump_handle = tokio::spawn(async move {
+            let start = Instant::now();
+            while let Some(frame) = frame_rx.recv().await {
+                // appsrc with do-timestamp=true will fill in PTS for us,
+                // so we don't need to override the buffer's timestamp here.
+                // We just hand it raw bytes.
+                let mut buf = Buffer::with_size(frame.bytes.len()).expect("alloc gst buffer");
+                {
+                    let buf_mut = buf.get_mut().expect("fresh buffer is unique");
+                    let mut map = buf_mut.map_writable().expect("map writable");
+                    map.copy_from_slice(&frame.bytes);
+                    drop(map);
+                    // Set a coarse PTS based on wall-clock from pump start,
+                    // so a downstream that ignores do-timestamp still has
+                    // monotonic timing to work with.
+                    let elapsed = start.elapsed().as_nanos() as u64;
+                    buf_mut.set_pts(ClockTime::from_nseconds(elapsed));
+                }
+                if let Err(e) = appsrc.push_buffer(buf) {
+                    tracing::warn!(error = %e, "appsrc push_buffer failed; stopping pump");
+                    break;
+                }
+            }
+            // Signal end-of-stream to gst when the pipewire side has shut.
+            let _ = appsrc.end_of_stream();
+            tracing::info!("frame pump exited");
+        });
+
+        tracing::info!("pipeline: → Playing (calling set_state)");
         tracing::info!("pipeline: → Playing (calling set_state)");
         // gst's set_state is documented as non-blocking, but on systems with
         // gst-plugin-pipewire builds that still hit the
