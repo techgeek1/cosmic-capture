@@ -243,7 +243,26 @@ impl VideoSession {
             _ = stop => {
                 tracing::info!("stop signal received; sending EOS");
                 self.pipeline.send_event(gstreamer::event::Eos::new());
-                bus_rx.recv().await.unwrap_or(Ok(()))
+                // Bound the wait: if the pipeline is wedged (e.g. no frames
+                // ever flowed because the portal handed us a dead stream),
+                // sending EOS won't ever produce a bus EOS/Error message,
+                // and a bare recv would hang the user's "Stop" forever.
+                // Three seconds is plenty for a well-behaved mux finalize
+                // and short enough that a hang is recoverable.
+                let drain = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    bus_rx.recv(),
+                ).await;
+                match drain {
+                    Ok(Some(r)) => r,
+                    Ok(None) => Ok(()),
+                    Err(_) => {
+                        tracing::warn!(
+                            "pipeline did not respond to EOS within 3s — forcing teardown"
+                        );
+                        Ok(())
+                    }
+                }
             }
         };
 

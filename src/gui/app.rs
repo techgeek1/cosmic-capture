@@ -768,8 +768,12 @@ impl Panel {
     /// `set_size(w.unwrap_or(0), h.unwrap_or(0))` unconditionally, so
     /// `Some((None, None))` here would silently break the configure.
     ///
-    /// Keyboard interactivity is `None` so keys flow through to whatever
-    /// app the user is recording. Stop/cancel are mouse-only.
+    /// Keyboard interactivity is `OnDemand`: the surface receives keys only
+    /// when the user clicks into it. Default state lets keys flow through to
+    /// the apps being recorded, but the pill itself is focusable so Space/
+    /// Esc work once the user has interacted with it. (Pure `None` had a
+    /// problem where cosmic-comp didn't seem to deliver mouse events to the
+    /// surface either, making the Stop button unclickable.)
     fn open_stop_pill(&mut self) -> Task<Msg> {
         if self.stop_pill_id.is_some() {
             return Task::none();
@@ -783,7 +787,7 @@ impl Panel {
         get_layer_surface(SctkLayerSurfaceSettings {
             id,
             layer: Layer::Overlay,
-            keyboard_interactivity: KeyboardInteractivity::None,
+            keyboard_interactivity: KeyboardInteractivity::OnDemand,
             input_zone: None,
             anchor: Anchor::BOTTOM,
             output: IcedOutput::Active,
@@ -1066,6 +1070,13 @@ impl Panel {
     /// button (which forwards to `PrimaryAction`) and a Quit icon for
     /// cancel-with-discard via the existing Esc path.
     fn view_stop_pill(&self) -> Element<'_, Msg> {
+        // Upgrade to info so it shows under the default RUST_LOG filter —
+        // helps diagnose "stop button doesn't work" reports because we can
+        // see (a) whether the pill is being rendered at all, (b) what
+        // capture state it sees, and (c) by inference whether the click is
+        // even reaching iced (compare with on_primary_action's log).
+        tracing::info!(state = ?self.capture, has_pill_id = self.stop_pill_id.is_some(),
+            "rendering stop pill");
         let press_stop = matches!(self.capture, CaptureState::Recording { .. })
             .then_some(Msg::PrimaryAction);
         let stop = record_button(&self.capture, press_stop.is_some(), press_stop);
