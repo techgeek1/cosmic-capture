@@ -247,6 +247,11 @@ pub struct Panel {
     /// `Some(Instant)` while a recording is in progress — used to render the
     /// elapsed-time label on the stop pill. Cleared on shutdown.
     recording_started_at: Option<std::time::Instant>,
+    /// `Some(Instant)` once the user has requested stop and we're waiting
+    /// for the pipeline to drain. If it lingers past a threshold the Tick
+    /// handler force-shuts to avoid the user being trapped behind a hung
+    /// gst pipeline.
+    saving_started_at: Option<std::time::Instant>,
     /// Set true when Esc fires during recording. gst can't abort mid-stream
     /// (the muxer would leave a corrupt file), so we still let it drain;
     /// the *Finished message handler reads this flag and deletes the
@@ -325,6 +330,7 @@ impl Application for Panel {
             stop_pill_id: None,
             capture: CaptureState::default(),
             recording_started_at: None,
+            saving_started_at: None,
             cancel_pending: false,
         };
 
@@ -480,8 +486,26 @@ impl Application for Panel {
                 self.toplevels = list;
             }
             Msg::Tick => {
-                // No state mutation needed — the tick just triggers a
-                // re-render so view_stop_pill picks up a fresh elapsed time.
+                // While Saving, watch for a hung pipeline (e.g. gst stuck
+                // on EOS after the pwsrc caps assertion) and force a
+                // shutdown after a generous grace period so the user isn't
+                // trapped behind a frozen "Saving…" UI. cancel_pending
+                // ensures any in-flight output file is deleted.
+                if matches!(self.capture, CaptureState::Saving) {
+                    if let Some(started) = self.saving_started_at {
+                        if started.elapsed() > std::time::Duration::from_secs(5) {
+                            tracing::warn!(
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "Saving stalled — forcing shutdown"
+                            );
+                            self.cancel_pending = true;
+                            return self.shutdown();
+                        }
+                    }
+                }
+                // Otherwise no state mutation needed — the tick just
+                // triggers a re-render so view_stop_pill picks up a fresh
+                // elapsed time.
             }
             Msg::CaptureToplevel(identifier) => {
                 if !matches!(self.capture, CaptureState::Idle) {
@@ -510,12 +534,21 @@ impl Application for Panel {
                     if let Some(tx) = stop_tx.take() {
                         let _ = tx.send(());
                     }
+                    self.saving_started_at = Some(std::time::Instant::now());
                 }
                 CaptureState::Idle => {
                     // Not recording → Esc exits the application entirely.
                     return self.shutdown();
                 }
-                _ => {}
+                CaptureState::Saving => {
+                    // Escape hatch for a stuck save (e.g. gst hung waiting
+                    // on EOS that never arrives, as happens after the
+                    // pipewiresrc caps assertion). Forces shutdown so the
+                    // user isn't trapped with a frozen "Saving…" UI.
+                    tracing::warn!("Esc during Saving → forcing shutdown");
+                    self.cancel_pending = true;
+                    return self.shutdown();
+                }
             },
 
             msg @ (Msg::RecordingFinished(_) | Msg::GifFinished(_) | Msg::ScreenshotFinished(_)) => {
@@ -642,10 +675,14 @@ impl Application for Panel {
             },
             _ => None,
         });
-        // Periodic tick during recording so the elapsed-time label refreshes
-        // once per second. Skipped when not recording — no subscription at
-        // all means no wakeups when idle.
-        let tick = if matches!(self.capture, CaptureState::Recording { .. }) {
+        // Periodic tick during recording/saving so the elapsed-time label
+        // refreshes once per second and the saving-stall watchdog has a
+        // pulse to check against. Skipped when idle — no subscription at
+        // all means no wakeups.
+        let tick = if matches!(
+            self.capture,
+            CaptureState::Recording { .. } | CaptureState::Saving
+        ) {
             iced::time::every(std::time::Duration::from_secs(1)).map(|_| Msg::Tick)
         } else {
             Subscription::none()
@@ -913,6 +950,7 @@ impl Panel {
                     let _ = tx.send(());
                 }
                 self.capture = CaptureState::Saving;
+                self.saving_started_at = Some(std::time::Instant::now());
                 Task::none()
             }
             CaptureState::Idle => match self.mode {
