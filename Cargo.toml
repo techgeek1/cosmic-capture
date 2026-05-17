@@ -49,10 +49,21 @@ cosmic-theme = { git = "https://github.com/pop-os/libcosmic" }
 # COSMIC GUI toolkit — for the pre-flight panel / HUD.
 libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = ["tokio", "wayland", "winit", "single-instance", "wgpu", "multi-window", "desktop"] }
 
-# GStreamer pipeline: pipewiresrc + encoders + appsink
+# GStreamer pipeline: appsrc/pipewiresrc + encoders + appsink. We feed
+# raw RGBA frames into appsrc ourselves via pipewire-rs so the recording
+# path doesn't depend on gst-plugin-pipewire, which has a known
+# gst_caps_is_fixed (pwsrc->caps) assertion on cosmic-comp's screencast.
 gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
+
+# Direct PipeWire stream consumption. We connect to the node id the
+# screencast portal hands us as a consumer (Direction::Input), pump
+# buffers out of the stream's process callback, and forward them to a
+# gst appsrc with pre-fixed caps — sidestepping the assertion entirely.
+pipewire = "0.9"
+libspa = "0.9"
+libspa-sys = "0.9"
 
 # GIF encoding
 gifski = { version = "1.32", default-features = false }
