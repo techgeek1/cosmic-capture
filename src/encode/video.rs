@@ -133,20 +133,15 @@ impl VideoSession {
         // `appsrc name=src` is fed from `pump_frames` below. is-live=true
         // makes the source clock to wall-clock; format=time so we can stamp
         // PTS on buffers (or omit them and let do-timestamp do its job).
-        // Caps are pre-fixed from the pipewire negotiation, so no caps
-        // assertion can wedge us mid-flight.
-        //
-        // The caps value MUST be quoted: gst-launch's tokenizer splits
-        // properties on whitespace, but inside `caps=...` the value can
-        // contain commas (`format=`, `width=`, etc.) that gst-launch would
-        // otherwise mis-read as element properties — and `format` is in
-        // fact a valid appsrc property (time/bytes), so an unquoted caps
-        // value with `format=RGBA` silently clobbers the appsrc's format
-        // and leaves the real caps as just `video/x-raw`, which downstream
-        // refuses to negotiate (`not-negotiated (-4)` from GstBaseSrc).
+        // Caps are NOT set inline here — gst-launch's quote handling for
+        // caps with commas (`format=`, `width=`, `framerate=`) is brittle
+        // across versions and gst-launch will silently mis-bind comma-
+        // separated pairs as element properties (e.g. `format=RGBA`
+        // clobbers appsrc's own `format` property). We let parse_launch
+        // construct the element shape with no caps, then `set_caps()` it
+        // via the gstreamer-app API below — same effect, no parsing.
         let pipeline_str = format!(
             "appsrc name=src is-live=true format=time do-timestamp=true \
-                  caps=\"video/x-raw,format={gst_fmt},width={src_w},height={src_h},framerate={src_fps}/1\" \
              ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! videorate drop-only=true max-rate={fps} \
              ! video/x-raw,framerate={fps}/1 \
@@ -157,9 +152,6 @@ impl VideoSession {
              ! {parser} \
              ! {muxer} name=mux \
              ! filesink name=sink location={location} {audio}",
-            src_w = format.width,
-            src_h = format.height,
-            src_fps = format.fps.max(1),
             audio = audio_branch,
         );
         tracing::info!(%pipeline_str, "constructing gst pipeline");
