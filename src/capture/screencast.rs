@@ -10,6 +10,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use anyhow::{Context, Result};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
+use ashpd::enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
 
 use crate::paths;
@@ -35,7 +36,25 @@ pub async fn start(cursor: bool) -> Result<PipeWireStream> {
     let stored = load_token().unwrap_or_default();
 
     let proxy = Screencast::new().await.context("create Screencast proxy")?;
-    let session = proxy.create_session().await.context("create Screencast session")?;
+
+    // Ask the portal which source types it actually supports. Some
+    // portal implementations refuse `SourceType::Window` outright and
+    // will reject the whole `select_sources` call if it appears in the
+    // requested bitmask, even though we'd happily accept `Monitor` only.
+    let available = match proxy.available_source_types().await {
+        Ok(types) => types,
+        Err(e) => {
+            tracing::warn!(error = %e, "available_source_types failed; falling back to Monitor");
+            BitFlags::from(SourceType::Monitor)
+        }
+    };
+    let requested = (SourceType::Monitor | SourceType::Window) & available;
+    let requested = if requested.is_empty() {
+        BitFlags::from(SourceType::Monitor)
+    } else {
+        requested
+    };
+    tracing::info!(?available, ?requested, "ScreenCast source types");
 
     let cursor_mode = if cursor {
         CursorMode::Embedded
@@ -43,24 +62,65 @@ pub async fn start(cursor: bool) -> Result<PipeWireStream> {
         CursorMode::Hidden
     };
 
-    proxy
+    // Try once with the stored restore_token (if any). If select_sources
+    // or start fails, the token may be stale — wipe it and retry from
+    // scratch so the user can re-pick a source rather than being stuck
+    // forever.
+    let session = proxy
+        .create_session()
+        .await
+        .context("create Screencast session")?;
+
+    let first_attempt = proxy
         .select_sources(
             &session,
             cursor_mode,
-            SourceType::Monitor | SourceType::Window,
+            requested,
             false,
             stored.restore_token.as_deref(),
             PersistMode::ExplicitlyRevoked,
         )
-        .await
-        .context("Screencast select_sources")?;
+        .await;
 
-    let response = proxy
-        .start(&session, None)
-        .await
-        .context("Screencast start")?
-        .response()
-        .context("Screencast start response")?;
+    let (session, response) = match first_attempt {
+        Ok(_) => {
+            let response = proxy
+                .start(&session, None)
+                .await
+                .context("Screencast start")?
+                .response()
+                .context("Screencast start response")?;
+            (session, response)
+        }
+        Err(e) if stored.restore_token.is_some() => {
+            tracing::warn!(error = %e, "select_sources failed with stored token; clearing and retrying");
+            let _ = std::fs::remove_file(token_path()?);
+            // The failed session is unusable — start over from a fresh one.
+            let session2 = proxy
+                .create_session()
+                .await
+                .context("create Screencast session (retry)")?;
+            proxy
+                .select_sources(
+                    &session2,
+                    cursor_mode,
+                    requested,
+                    false,
+                    None,
+                    PersistMode::ExplicitlyRevoked,
+                )
+                .await
+                .context("Screencast select_sources (retry)")?;
+            let response = proxy
+                .start(&session2, None)
+                .await
+                .context("Screencast start (retry)")?
+                .response()
+                .context("Screencast start response (retry)")?;
+            (session2, response)
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("Screencast select_sources")),
+    };
 
     if let Some(tok) = response.restore_token() {
         if stored.restore_token.as_deref() != Some(tok) {
