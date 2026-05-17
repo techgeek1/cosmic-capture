@@ -56,11 +56,38 @@ pub async fn start(cursor: bool) -> Result<PipeWireStream> {
     };
     tracing::info!(?available, ?requested, "ScreenCast source types");
 
-    let cursor_mode = if cursor {
-        CursorMode::Embedded
-    } else {
-        CursorMode::Hidden
+    // Some portals (notably xdg-desktop-portal-cosmic at time of writing)
+    // don't implement `CursorMode::Embedded`. Ask the portal and pick the
+    // best mode actually advertised, treating `cursor: true` as a hint
+    // rather than a hard requirement.
+    let available_cursor = match proxy.available_cursor_modes().await {
+        Ok(modes) => modes,
+        Err(e) => {
+            tracing::warn!(error = %e, "available_cursor_modes failed; defaulting to Hidden");
+            BitFlags::from(CursorMode::Hidden)
+        }
     };
+    let cursor_mode = if cursor {
+        if available_cursor.contains(CursorMode::Embedded) {
+            CursorMode::Embedded
+        } else {
+            // The other variant (Metadata) hands us a separate spa meta
+            // stream which our pipewire consumer doesn't composite, so
+            // claiming "cursor on" via Metadata would silently drop the
+            // pointer. Prefer the honest behavior: log and turn it off.
+            tracing::warn!(
+                "portal does not support Embedded cursor mode; \
+                 recording without cursor"
+            );
+            CursorMode::Hidden
+        }
+    } else if available_cursor.contains(CursorMode::Hidden) {
+        CursorMode::Hidden
+    } else {
+        // Truly degenerate portal — just pick any advertised mode.
+        available_cursor.iter().next().unwrap_or(CursorMode::Hidden)
+    };
+    tracing::info!(?available_cursor, ?cursor_mode, "ScreenCast cursor mode");
 
     // Try once with the stored restore_token (if any). If select_sources
     // or start fails, the token may be stale — wipe it and retry from
