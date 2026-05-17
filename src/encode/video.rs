@@ -133,8 +133,17 @@ impl VideoSession {
         //    encoder.
         //  * `do-timestamp=true` on pipewiresrc uses our local clock so
         //    videorate has monotonic timestamps to work with.
+        //  * Capsfilter `video/x-raw` right after pipewiresrc constrains
+        //    negotiation to raw video. Without it, cosmic-comp's screencast
+        //    advertises a parameter set that includes alternatives and
+        //    older gst-plugin-pipewire hits
+        //    `handle_format_change: assertion 'gst_caps_is_fixed (pwsrc->caps)'`
+        //    because the handler expects fixed caps. The downstream
+        //    capsfilter forces upstream negotiation to converge on a single
+        //    raw-video format before the assertion runs.
         let pipeline_str = format!(
             "pipewiresrc fd={fd} path={node} do-timestamp=true keepalive-time=1000 \
+             ! video/x-raw \
              ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! videorate drop-only=true max-rate={fps} \
              ! video/x-raw,framerate={fps}/1 \
@@ -257,8 +266,14 @@ impl VideoSession {
                     Ok(Some(r)) => r,
                     Ok(None) => Ok(()),
                     Err(_) => {
+                        let frames = self.frames_at_crop.load(Ordering::Relaxed);
+                        let bytes = self.bytes_at_sink.load(Ordering::Relaxed);
                         tracing::warn!(
-                            "pipeline did not respond to EOS within 3s — forcing teardown"
+                            frames, bytes,
+                            "pipeline did not respond to EOS within 3s — forcing teardown. \
+                             frames=0 means pipewiresrc never produced output (likely the \
+                             pwsrc caps assertion); frames>0 means the muxer is stuck \
+                             finalizing."
                         );
                         Ok(())
                     }
