@@ -12,6 +12,7 @@
 //! frames flow.
 
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -134,9 +135,18 @@ impl VideoSession {
         // PTS on buffers (or omit them and let do-timestamp do its job).
         // Caps are pre-fixed from the pipewire negotiation, so no caps
         // assertion can wedge us mid-flight.
+        //
+        // The caps value MUST be quoted: gst-launch's tokenizer splits
+        // properties on whitespace, but inside `caps=...` the value can
+        // contain commas (`format=`, `width=`, etc.) that gst-launch would
+        // otherwise mis-read as element properties — and `format` is in
+        // fact a valid appsrc property (time/bytes), so an unquoted caps
+        // value with `format=RGBA` silently clobbers the appsrc's format
+        // and leaves the real caps as just `video/x-raw`, which downstream
+        // refuses to negotiate (`not-negotiated (-4)` from GstBaseSrc).
         let pipeline_str = format!(
             "appsrc name=src is-live=true format=time do-timestamp=true \
-                  caps=video/x-raw,format={gst_fmt},width={src_w},height={src_h},framerate={src_fps}/1 \
+                  caps=\"video/x-raw,format={gst_fmt},width={src_w},height={src_h},framerate={src_fps}/1\" \
              ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
              ! videorate drop-only=true max-rate={fps} \
              ! video/x-raw,framerate={fps}/1 \
@@ -164,6 +174,20 @@ impl VideoSession {
             .ok_or_else(|| anyhow::anyhow!("appsrc 'src' missing from pipeline"))?
             .dynamic_cast::<AppSrc>()
             .map_err(|_| anyhow::anyhow!("'src' element is not an AppSrc"))?;
+
+        // Set caps via the API too — defense in depth against gst-launch's
+        // quoting quirks. Builds the same caps string but as a structured
+        // GstCaps so there's no parsing involved.
+        let caps_str = format!(
+            "video/x-raw,format={gst_fmt},width={src_w},height={src_h},framerate={src_fps}/1",
+            src_w = format.width,
+            src_h = format.height,
+            src_fps = format.fps.max(1),
+        );
+        let caps = gstreamer::Caps::from_str(&caps_str)
+            .with_context(|| format!("parse appsrc caps {caps_str:?}"))?;
+        appsrc.set_caps(Some(&caps));
+        tracing::info!(%caps_str, "appsrc caps set via API");
 
         if matches!(encoder, VideoEncoder::Auto)
             && ElementFactory::find("vaapih264enc").is_none()
