@@ -208,7 +208,44 @@ impl VideoSession {
 
     pub async fn run(self, stop: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
         tracing::info!("pipeline: → Playing (calling set_state)");
-        let state_result = self.pipeline.set_state(State::Playing);
+        // gst's set_state is documented as non-blocking, but on systems with
+        // gst-plugin-pipewire builds that still hit the
+        // gst_caps_is_fixed (pwsrc->caps) assertion, the NULL→PLAYING
+        // transition can synchronously wedge inside the pwsrc element. That
+        // parks the tokio worker thread, so even when the user clicks Stop
+        // and stop_tx.send() succeeds, our tokio::select can never poll the
+        // receiver — the future is blocked, not pending.
+        //
+        // Run set_state on a blocking thread with a hard timeout so a stuck
+        // pipewiresrc can't take the recording flow with it. The blocking
+        // thread leaks until process exit if the call never returns, but
+        // that's fine: when this errors we propagate up and shut down.
+        let pipeline_for_start = self.pipeline.clone();
+        let state_call = tokio::task::spawn_blocking(move || {
+            pipeline_for_start.set_state(State::Playing)
+        });
+        let state_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            state_call,
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                anyhow::bail!("set_state(Playing) task panicked: {e}");
+            }
+            Err(_) => {
+                tracing::error!(
+                    "set_state(Playing) did not return within 3s — pipewiresrc \
+                     is wedged (likely the gst_caps_is_fixed assertion). \
+                     Aborting recording so the UI can recover."
+                );
+                anyhow::bail!(
+                    "pipeline failed to start within 3s (pipewiresrc wedged \
+                     on caps negotiation)"
+                );
+            }
+        };
         tracing::info!(?state_result, "pipeline: set_state(Playing) returned");
         state_result.context("pipeline → Playing")?;
         let bus = self.pipeline.bus().context("pipeline bus")?;
@@ -304,7 +341,22 @@ impl VideoSession {
             );
         }
 
-        self.pipeline.set_state(State::Null).context("pipeline → Null")?;
+        // Drop to Null. Same blocking-call concern as the Playing transition:
+        // a wedged element can hang the call indefinitely. Bounded at 2s so
+        // a broken pipeline can't trap process shutdown either.
+        let pipeline_for_stop = self.pipeline.clone();
+        let null_call = tokio::task::spawn_blocking(move || {
+            pipeline_for_stop.set_state(State::Null)
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(2), null_call).await {
+            Ok(Ok(r)) => {
+                r.context("pipeline → Null")?;
+            }
+            Ok(Err(e)) => tracing::warn!(error = %e, "set_state(Null) task panicked"),
+            Err(_) => tracing::warn!(
+                "set_state(Null) did not return within 2s — leaking pipeline"
+            ),
+        }
         let _ = bus_thread.join();
         result
     }
