@@ -573,7 +573,7 @@ impl Application for Panel {
                         }
                     }
                 } else if let Err(e) = &r {
-                    tracing::warn!(error = %e, "capture pipeline finished with error");
+                    tracing::warn!("capture pipeline finished with error: {}", e);
                 } else if let Ok(p) = &r {
                     tracing::info!(path = %p, "capture pipeline finished");
                     if is_recording_path {
@@ -1555,7 +1555,7 @@ async fn run_record(
     pipeline::record::record_with_crop(args, crop, stop_rx)
         .await
         .map(path_to_string)
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("{:#}", e))
 }
 async fn run_gif(
     args: GifArgs,
@@ -1565,7 +1565,7 @@ async fn run_gif(
     pipeline::gif::gif_with_crop(args, crop, stop_rx)
         .await
         .map(path_to_string)
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("{:#}", e))
 }
 async fn run_screenshot(
     output_name: String,
@@ -1577,7 +1577,7 @@ async fn run_screenshot(
     pipeline::screenshot::capture_with(output_name, cursor, crop, destination, notify_user)
         .await
         .map(path_to_string)
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("{:#}", e))
 }
 async fn run_toplevel_screenshot(
     identifier: String,
@@ -1588,7 +1588,7 @@ async fn run_toplevel_screenshot(
     pipeline::screenshot::capture_toplevel(identifier, cursor, destination, notify_user)
         .await
         .map(path_to_string)
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("{:#}", e))
 }
 
 /// Run toplevel enumeration on the blocking pool. Empty result on error so
