@@ -12,5 +12,6 @@ pub mod pipewire_capture;
 pub mod screencast;
 pub mod screencopy;
 pub mod screenshot;
+pub mod toplevel_capture;
 pub mod toplevels;
 pub mod wayland;

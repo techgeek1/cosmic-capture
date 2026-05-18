@@ -22,8 +22,15 @@ use gstreamer::prelude::*;
 use gstreamer::{Buffer, ClockTime, ElementFactory, MessageView, PadProbeReturn, PadProbeType, Pipeline, State};
 use gstreamer_app::AppSrc;
 
-use crate::capture::pipewire_capture::{Capture as PwCapture, Frame, StreamFormat, gst_format_name};
+use crate::capture::pipewire_capture::{Frame, StreamFormat, gst_format_name};
 use crate::cli::{VideoContainer, VideoEncoder};
+
+/// Erased drop-handle for whichever capture source is feeding frames into
+/// this session. Held only for lifetime; dropping it tears down the
+/// source. Two concrete producers today:
+///   * `pipewire_capture::Capture` — screencast portal + pipewire stream
+///   * `toplevel_capture::Capture` — cosmic-screencopy on a toplevel
+pub type CaptureHandle = Box<dyn std::any::Any + Send>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CropRect {
@@ -62,14 +69,15 @@ pub struct VideoSession {
     appsrc: AppSrc,
     frames_at_crop: Arc<AtomicU64>,
     bytes_at_sink: Arc<AtomicU64>,
-    /// Hold the pipewire consumer alive for the duration of recording —
-    /// drop on session teardown stops the pipewire thread.
-    _pw_capture: PwCapture,
+    /// Hold the frame-source alive for the duration of recording —
+    /// drop on session teardown stops whichever capture thread (pipewire
+    /// or toplevel-screencopy) is producing frames.
+    _capture: CaptureHandle,
 }
 
 impl VideoSession {
     pub fn build(
-        pw_capture: PwCapture,
+        capture: CaptureHandle,
         format: StreamFormat,
         output: &Path,
         fps: u32,
@@ -232,7 +240,7 @@ impl VideoSession {
             appsrc,
             frames_at_crop,
             bytes_at_sink,
-            _pw_capture: pw_capture,
+            _capture: capture,
         })
     }
 

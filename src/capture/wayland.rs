@@ -312,6 +312,23 @@ impl WaylandHelper {
         .await;
     }
 
+    /// Resolve a stable `identifier` (from `ext_foreign_toplevel_list_v1`)
+    /// back to the live wayland proxy. Used by the recording path to take
+    /// a click in our picker and start a screencopy session against the
+    /// matching toplevel.
+    pub fn toplevel_handle_for_identifier(
+        &self,
+        id: &str,
+    ) -> Option<ExtForeignToplevelHandleV1> {
+        self.inner
+            .toplevels
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.identifier == id)
+            .map(|t| t.foreign_toplevel.clone())
+    }
+
     pub fn output_for_name(&self, name: &str) -> Option<wl_output::WlOutput> {
         self.inner
             .output_infos

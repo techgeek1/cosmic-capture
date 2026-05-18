@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 
 use crate::capture::pipewire_capture;
 use crate::capture::screencast;
+use crate::capture::toplevel_capture;
+use crate::capture::wayland::WaylandHelper;
 use crate::cli::RecordArgs;
 use crate::encode::video::{CropRect, VideoSession};
 use crate::selector::{self, SelectionCancelled};
@@ -50,7 +52,7 @@ pub async fn record_with_crop(
     )?;
 
     let session = VideoSession::build(
-        capture,
+        Box::new(capture),
         format,
         &path,
         args.fps,
@@ -58,6 +60,65 @@ pub async fn record_with_crop(
         args.encoder,
         args.audio,
         crop,
+    )?;
+
+    session.run(stop_rx, frame_rx).await?;
+
+    if args.common.notify {
+        if let Err(e) = notify::saved(&path, "Recording").await {
+            tracing::warn!(error = %e, "failed to send notification");
+        }
+    }
+    Ok(path)
+}
+
+/// Record a single toplevel by its stable `identifier`. Bypasses the
+/// screencast portal entirely — frames come from cosmic-screencopy
+/// driven by `toplevel_capture`, fed into the same VideoSession encoder
+/// pipeline as the screen-record path. Crop is unsupported (the
+/// toplevel's own bounds *are* the crop).
+pub async fn record_toplevel(
+    helper: WaylandHelper,
+    identifier: String,
+    args: RecordArgs,
+    stop_rx: oneshot::Receiver<()>,
+) -> Result<PathBuf> {
+    tracing::info!(
+        identifier = %identifier,
+        container = ?args.container,
+        fps = args.fps,
+        encoder = ?args.encoder,
+        "record_toplevel: starting"
+    );
+
+    let (capture, fmt_rx, frame_rx) =
+        toplevel_capture::start(helper, identifier.clone(), args.cursor, args.fps)
+            .context("start toplevel_capture")?;
+
+    // First frame seeds the StreamFormat. cosmic-comp typically responds
+    // in <50ms; 5s is the same generous deadline screencast::start uses
+    // for portal-side format negotiation.
+    let format = tokio::time::timeout(std::time::Duration::from_secs(5), fmt_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("toplevel screencopy did not produce a frame within 5s"))?
+        .map_err(|_| anyhow::anyhow!("toplevel_capture dropped before first frame"))?;
+    tracing::info!(?format, "toplevel screencopy format ready");
+
+    let path = paths::resolve(
+        args.common.file.clone(),
+        paths::Kind::Recording,
+        args.container.extension(),
+    )?;
+
+    let session = VideoSession::build(
+        Box::new(capture),
+        format,
+        &path,
+        args.fps,
+        args.container,
+        args.encoder,
+        args.audio,
+        None,
     )?;
 
     session.run(stop_rx, frame_rx).await?;
