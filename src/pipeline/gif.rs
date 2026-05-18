@@ -28,7 +28,7 @@ pub async fn gif_with_crop(
         .map_err(|_| anyhow::anyhow!("pipewire capture thread dropped before format arrived (gif)"))?;
     tracing::info!(?format, "pipewire format ready, building gif pipeline");
 
-    let path = paths::resolve(args.common.file.clone(), paths::Kind::Image, "gif")?;
+    let path = paths::resolve(args.common.file.clone(), paths::Kind::Recording, "gif")?;
     let session = GifSession::build(
         capture,
         format,

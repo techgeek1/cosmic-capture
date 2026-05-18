@@ -1070,6 +1070,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmic-bg-config"
+version = "1.0.3"
+source = "git+https://github.com/pop-os/cosmic-bg#b1ca4c180ab29dd185472b777ab0abdb1f96ccaf"
+dependencies = [
+ "cosmic-config",
+ "derive_setters",
+ "image",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "cosmic-capture"
 version = "0.1.0"
 dependencies = [
@@ -1077,6 +1089,7 @@ dependencies = [
  "ashpd 0.12.3",
  "chrono",
  "clap",
+ "cosmic-bg-config",
  "cosmic-client-toolkit",
  "cosmic-config",
  "cosmic-theme",
@@ -1090,6 +1103,7 @@ dependencies = [
  "libcosmic",
  "libspa",
  "libspa-sys",
+ "memmap2 0.9.10",
  "pipewire",
  "png 0.17.16",
  "rgb",
@@ -3371,7 +3385,6 @@ dependencies = [
  "palette",
  "phf 0.13.1",
  "rfd",
- "ron 0.12.1",
  "rust-embed",
  "rustix 1.1.4",
  "serde",

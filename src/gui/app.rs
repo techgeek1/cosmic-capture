@@ -31,14 +31,16 @@ use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
     IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
 };
 use cosmic::iced::{
-    self, Background, Border, Color, Length, Limits, Subscription, event, keyboard, mouse, window,
+    self, Background, Border, Color, Length, Limits, Subscription, event, keyboard, mouse,
+    window,
 };
 use cosmic::widget::{button, container, dropdown, icon, row};
 use cosmic::{Application, Element, executor};
 use tokio::sync::oneshot;
 use wayland_client::protocol::wl_output::WlOutput;
 
-use crate::capture::screencopy::{self, CapturedFrame};
+use crate::capture::screencopy::CapturedFrame;
+use crate::capture::wayland::{WaylandHelper, WindowCapture};
 use crate::cli::{CommonArgs, GifArgs, RecordArgs, VideoContainer, VideoEncoder};
 use crate::encode::video::CropRect;
 use crate::pipeline;
@@ -61,6 +63,12 @@ pub fn launch() -> Result<()> {
         .no_main_window(true)
         .exit_on_close(false)
         .transparent(true);
+    // WaylandHelper is created inside `Application::init` — direct port
+    // of xdg-desktop-portal-cosmic's `CosmicPortal::init`. Creating it
+    // *before* `cosmic::app::run` was a divergence from the canonical
+    // reference and made the picker take ~10s to respond on the first
+    // Window-source click. The portal opens its wayland connection only
+    // after iced's main loop is up; we now do the same.
     let result = cosmic::app::run::<Panel>(settings, ())
         .map_err(|e| anyhow::anyhow!("libcosmic exited with error: {e}"));
     tracing::info!(?result, "GUI exited");
@@ -218,6 +226,12 @@ struct OutputInfo {
     /// involves a stride-repack copy that we don't want to redo every
     /// frame.
     frozen_handle: Option<cosmic::iced::widget::image::Handle>,
+    /// Output's wallpaper config — pulled from `cosmic_bg_config::state`
+    /// on output discovery. Window-mode picker paints this as its
+    /// background (path → image, color → solid/gradient) so the
+    /// foreground toplevel tiles aren't competing with their own
+    /// reflections in a frozen output capture.
+    bg_source: Option<cosmic_bg_config::Source>,
 }
 
 pub struct Panel {
@@ -271,6 +285,50 @@ pub struct Panel {
     /// flash a border at once, which obscured the "which one am I about
     /// to capture" affordance the border is supposed to provide.
     hovered_toolbar: Option<window::Id>,
+    /// Window-picker state: toplevels with thumbnails grouped by the
+    /// output they sit on. Mirrors xdg-desktop-portal-cosmic's
+    /// `toplevel_images: HashMap<String, Vec<ScreenshotImage>>`. Filled
+    /// in by the per-output stream from `WaylandHelper`.
+    windows: HashMap<String, Vec<WindowEntry>>,
+    /// Invisible 6x6 placeholder layer surface opened at startup. Direct
+    /// port of `CosmicPortal::init`'s `dummy_id` surface
+    /// (`xdg-desktop-portal-cosmic/src/app.rs`): with `no_main_window`
+    /// the iced runtime sits idle until at least one surface exists, so
+    /// wgpu + the wayland event loop don't fully spin up. Without this
+    /// dummy, the first real layer surface (toolbar / picker) is created
+    /// against a cold runtime and its first frame — plus every
+    /// `Task::perform` result queued during the cold-start — gets stalled
+    /// for seconds while iced finally initializes. Holding one tiny
+    /// always-present surface keeps the runtime warm; real surfaces
+    /// opened later just attach to it.
+    dummy_id: window::Id,
+    /// Long-lived wayland connection + state used for every screencopy
+    /// + toplevel-info call. Replaces the prior pattern of opening a
+    /// fresh wayland connection inside each `capture::screencopy::capture`
+    /// / `capture::toplevels::list` call (which serialized everything
+    /// through a global mutex and still hung when one toplevel was
+    /// unresponsive).
+    helper: WaylandHelper,
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowEntry {
+    identifier: String,
+    /// Carried for future use (label rendering, debugging, telemetry).
+    #[allow(dead_code)]
+    title: String,
+    /// Carried for future use (label rendering, debugging, telemetry).
+    #[allow(dead_code)]
+    app_id: String,
+    /// Pre-built iced image handle for the captured thumbnail. Cached
+    /// per entry because Handle::from_rgba copies the pixel buffer once
+    /// and we don't want to redo that every redraw.
+    thumb: cosmic::iced::widget::image::Handle,
+    /// Source window pixel width — used to size each picker tile
+    /// proportionally (`Length::FillPortion`) so a 1920px-wide window
+    /// gets a wider tile than a 480px utility palette. Same arithmetic
+    /// the portal applies in `widget/screenshot.rs`.
+    width: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -305,11 +363,20 @@ pub enum Msg {
     /// Pointer entered or left a toolbar surface. Tracked per-window so we
     /// can highlight only the display the user is currently on.
     PointerOn(Option<window::Id>),
-    /// Background capture for an output finished. Carries the output key
-    /// (HashMap index, not name) and the result. The toolbar layer surface
-    /// is opened only after this fires, so the captured frame doesn't
-    /// contain our own toolbar pill.
-    FrozenFrameReady(u32, std::result::Result<Arc<CapturedFrame>, String>),
+    /// Frozen-background capture for one output completed. Carries the
+    /// output key + the helper-side `CapturedFrame`. The result is
+    /// optional because the helper returns `None` for screencopy
+    /// failures.
+    FrozenFrameReady(u32, Option<Arc<CapturedFrame>>),
+    /// Per-output toplevel thumbnails arrived as a batch. Carries the
+    /// output name (matched against `OutputInfo.name`) and the captured
+    /// entries in stream order. Replaces the previous per-window
+    /// `Msg::WindowThumbReady` pattern — the helper's
+    /// `capture_output_toplevels_shm` already streams sessions on the
+    /// shared connection.
+    WindowsForOutputReady(String, Vec<WindowEntry>),
+    /// User clicked a window card → capture that window full-res and save.
+    CaptureToplevel(String),
     Quit,
 }
 
@@ -328,6 +395,17 @@ impl Application for Panel {
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
         let (settings, config) = super::config::UserSettings::load();
+        let dummy_id = window::Id::unique();
+        // Direct port of `CosmicPortal::init`: open the wayland connection
+        // *after* iced has started its main loop. Opening it earlier (in
+        // `launch` before `cosmic::app::run`) made the first picker open
+        // take ~10s — the helper's dispatch thread was running but iced's
+        // own wayland connection was still cold, so capture events stalled
+        // until iced caught up.
+        let wayland_conn = wayland_client::Connection::connect_to_env()
+            .expect("connect wayland");
+        let helper = WaylandHelper::new(wayland_conn)
+            .expect("wayland helper init");
         let panel = Self {
             core,
             config,
@@ -350,13 +428,35 @@ impl Application for Panel {
             saving_started_at: None,
             cancel_pending: false,
             hovered_toolbar: None,
+            windows: HashMap::new(),
+            helper,
+            dummy_id,
         };
 
-        // No toolbar surface yet — we wait for OutputEvent::Created and open
-        // one per output so users can capture from any monitor regardless of
-        // which one they were focused on when launching. See
-        // `ensure_toolbar_for_output`.
-        (panel, Task::none())
+        // Direct port of `CosmicPortal::init` in
+        // xdg-desktop-portal-cosmic/src/app.rs: open an invisible 6x6
+        // bottom-layer placeholder surface so iced's runtime, wgpu, and
+        // wayland event loop come up immediately instead of sitting cold
+        // until the first real surface arrives. Real surfaces opened
+        // later (toolbar in `ensure_toolbar_for`, picker, recording
+        // overlays) attach to the already-warm runtime and render
+        // without the multi-second cold-start stall. `view_window`
+        // returns an empty space for this id.
+        let dummy = get_layer_surface(SctkLayerSurfaceSettings {
+            id: dummy_id,
+            layer: Layer::Bottom,
+            keyboard_interactivity: KeyboardInteractivity::None,
+            input_zone: Some(Vec::new()),
+            anchor: Anchor::empty(),
+            output: IcedOutput::Active,
+            namespace: "cosmic-capture-dummy".into(),
+            margin: IcedMargin::default(),
+            size: Some((Some(6), Some(6))),
+            exclusive_zone: -1,
+            size_limits: Limits::NONE,
+        });
+
+        (panel, dummy)
     }
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
@@ -365,12 +465,48 @@ impl Application for Panel {
                 if !self.locked() && self.mode != m {
                     self.mode = m;
                     self.persist("mode", &m);
+                    let mut tasks: Vec<Task<Msg>> = Vec::new();
+                    match m {
+                        Mode::Screenshot => {
+                            let with_cursor = self.rec_cursor;
+                            for (&key, info) in &self.outputs {
+                                if info.frozen_handle.is_some() {
+                                    continue;
+                                }
+                                let helper = self.helper.clone();
+                                let name = info.name.clone();
+                                tasks.push(Task::perform(
+                                    async move {
+                                        capture_output_via_helper(&helper, &name, with_cursor)
+                                            .await
+                                    },
+                                    move |r| cosmic::action::app(Msg::FrozenFrameReady(key, r)),
+                                ));
+                            }
+                            if matches!(self.source, Source::Window) {
+                                tasks.push(self.refresh_window_picker());
+                            }
+                        }
+                        Mode::Record => {
+                            for info in self.outputs.values_mut() {
+                                info.frozen = None;
+                                info.frozen_handle = None;
+                            }
+                            self.windows.clear();
+                        }
+                    }
+                    if !tasks.is_empty() {
+                        return Task::batch(tasks);
+                    }
                 }
             }
             Msg::SetSource(s) => {
                 if !self.locked() && self.source != s {
                     self.source = s;
                     self.persist("source", &s);
+                    if matches!(s, Source::Window) && matches!(self.mode, Mode::Screenshot) {
+                        return self.refresh_window_picker();
+                    }
                 }
             }
             Msg::ToggleClipboard => self.clipboard = !self.clipboard,
@@ -412,6 +548,7 @@ impl Application for Panel {
                             .unwrap_or((0, 0));
                         let scale = info.scale_factor;
                         let name_for_capture = name.clone();
+                        let bg_source = load_bg_for_output(&name);
                         self.outputs.insert(
                             key,
                             OutputInfo {
@@ -424,6 +561,7 @@ impl Application for Panel {
                                 recording_id: None,
                                 frozen: None,
                                 frozen_handle: None,
+                                bg_source,
                             },
                         );
                         // First time we have any geometry, validate the
@@ -431,21 +569,40 @@ impl Application for Panel {
                         // gone, drop it so the user doesn't see a phantom
                         // rect pointing into empty space.
                         self.prune_stale_region();
-                        // Open the toolbar AND kick off a freeze capture in
-                        // parallel. Capturing first and opening after would
-                        // give a 50–100ms blank gap where the live screen
-                        // is visible with no toolbar; opening first means
-                        // the captured frame may briefly include our own
-                        // (transparent-except-for-pill) surface, but iced
-                        // typically hasn't committed its first frame by
-                        // the time screencopy grabs the buffer.
-                        let with_cursor = self.rec_cursor;
+                        // Open the toolbar. Freeze capture only fires in
+                        // Screenshot mode — Record needs the live screen
+                        // visible so the user can frame the action they're
+                        // about to record.
                         let open = self.ensure_toolbar_for(key);
-                        let freeze = Task::perform(
-                            capture_output(name_for_capture, with_cursor),
-                            move |r| cosmic::action::app(Msg::FrozenFrameReady(key, r)),
-                        );
-                        return Task::batch([open, freeze]);
+                        if matches!(self.mode, Mode::Screenshot) {
+                            let with_cursor = self.rec_cursor;
+                            let mut tasks = vec![open];
+                            // Freeze background for this output.
+                            let helper = self.helper.clone();
+                            let name_for_freeze = name_for_capture.clone();
+                            tasks.push(Task::perform(
+                                async move {
+                                    capture_output_via_helper(
+                                        &helper,
+                                        &name_for_freeze,
+                                        with_cursor,
+                                    )
+                                    .await
+                                },
+                                move |r| cosmic::action::app(Msg::FrozenFrameReady(key, r)),
+                            ));
+                            // Per-output window picker — only when the
+                            // user actually wants Window source. Without
+                            // this, a persisted Screenshot+Window state
+                            // would land on an empty picker until the
+                            // user toggled Source.
+                            if matches!(self.source, Source::Window) {
+                                let picker_name = name_for_capture.clone();
+                                tasks.push(self.spawn_picker_capture(picker_name, with_cursor));
+                            }
+                            return Task::batch(tasks);
+                        }
+                        return open;
                     }
                     OutputEvent::Created(None) => {}
                     OutputEvent::InfoUpdate(info) => {
@@ -623,33 +780,68 @@ impl Application for Panel {
                 return self.shutdown();
             }
 
+            Msg::WindowsForOutputReady(output_name, entries) => {
+                tracing::info!(
+                    output = %output_name,
+                    count = entries.len(),
+                    "window picker: per-output capture stream finished"
+                );
+                self.windows.insert(output_name, entries);
+            }
+            Msg::CaptureToplevel(identifier) => {
+                if !matches!(self.capture, CaptureState::Idle) {
+                    return Task::none();
+                }
+                let destination = self.current_destination();
+                let notify_user = self.notify;
+                let cursor = self.rec_cursor;
+                let close_bars = self.close_toolbars();
+                self.capture = CaptureState::Saving;
+                self.saving_started_at = Some(std::time::Instant::now());
+                return Task::batch([
+                    close_bars,
+                    Task::perform(
+                        run_toplevel_screenshot(identifier, cursor, destination, notify_user),
+                        |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+                    ),
+                ]);
+            }
+
             Msg::FrozenFrameReady(key, result) => {
                 let Some(info) = self.outputs.get_mut(&key) else {
                     return Task::none();
                 };
                 match result {
-                    Ok(frame) => {
+                    Some(frame) => {
                         let handle = frame_to_image_handle(&frame);
                         info.frozen = Some(frame);
                         info.frozen_handle = Some(handle);
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e,
-                            "freeze capture failed; toolbar will run live-screen");
+                    None => {
+                        tracing::warn!(
+                            output = %info.name,
+                            "freeze capture returned None; toolbar will run live-screen"
+                        );
                     }
                 }
             }
 
             Msg::PointerOn(id) => {
-                // Only accept hover transitions that name an actual toolbar
-                // surface — random window ids (stop pill, recording overlay)
-                // shouldn't suppress the border on the toolbar the user is
-                // on. `None` clears.
-                self.hovered_toolbar = id.filter(|id| {
+                // Only accept hover transitions that name an actual
+                // toolbar surface — random window ids (stop pill,
+                // recording overlay) shouldn't suppress the border on
+                // the toolbar the user is on. `None` clears. Skip the
+                // assignment if nothing actually changed so iced doesn't
+                // schedule a redraw for a no-op message.
+                let next = id.filter(|id| {
                     self.outputs
                         .values()
                         .any(|o| o.toolbar_id == Some(*id))
                 });
+                if next == self.hovered_toolbar {
+                    return Task::none();
+                }
+                self.hovered_toolbar = next;
             }
 
             Msg::Quit => {
@@ -669,6 +861,15 @@ impl Application for Panel {
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Msg> {
+        // Dummy warm-up surface from init() — invisible 6x6 placeholder.
+        // Returns empty space matching xdg-desktop-portal-cosmic's
+        // `view_window` branch for its dummy_id.
+        if id == self.dummy_id {
+            return iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
         // Stop pill — small bottom-centered surface that replaces the
         // toolbars while a recording is in progress. Owns the Exclusive
         // keyboard grab during recording so Space/Esc continue to work.
@@ -726,15 +927,11 @@ impl Application for Panel {
         // Pointer enter/exit per toolbar surface. iced's `listen_with`
         // surfaces a window id alongside each event; we use that to track
         // which output's toolbar the pointer is on so Source::Screen can
-        // highlight only that display. CursorMoved as a fallback covers the
-        // case where the pointer was already inside the surface at
-        // subscription start (no Entered event ever fires in that case).
+        // highlight only that display. `CursorMoved` fires at the cursor
+        // sample rate (60+ Hz × N outputs) and triggers a redraw every
+        // tick, so we only listen for the discrete enter/leave events.
         let pointer = event::listen_with(|e, _, id| match e {
-            iced::Event::Mouse(mouse::Event::CursorEntered)
-            | iced::Event::Mouse(mouse::Event::CursorMoved { .. })
-            | iced::Event::Mouse(mouse::Event::ButtonPressed(_)) => {
-                Some(Msg::PointerOn(Some(id)))
-            }
+            iced::Event::Mouse(mouse::Event::CursorEntered) => Some(Msg::PointerOn(Some(id))),
             iced::Event::Mouse(mouse::Event::CursorLeft) => Some(Msg::PointerOn(None)),
             _ => None,
         });
@@ -767,11 +964,10 @@ impl Panel {
             return false;
         }
         match (self.mode, self.source) {
-            // Screenshot+Window: clicking Capture invokes
-            // xdg-desktop-portal's interactive Screenshot UI (the same path
-            // cosmic-screenshot takes). The portal owns the window picker
-            // and freezes the screen while the user chooses, so we don't
-            // reimplement either of those client-side.
+            // Screenshot+Window: captures fire from clicks on the fan-out
+            // picker cards (`Msg::CaptureToplevel`), so the toolbar's
+            // primary action stays inactive.
+            (Mode::Screenshot, Source::Window) => false,
             (Mode::Screenshot, _) => true,
             // Record+Window: the screencast portal already advertises both
             // Monitor and Window source types — the user picks one in the
@@ -780,6 +976,53 @@ impl Panel {
             (Mode::Record, Source::Screen) => true,
             (Mode::Record, Source::Region) => self.region.is_some(),
         }
+    }
+
+    /// Kick off per-output toplevel capture streams. Each output's
+    /// stream replaces its entry in `self.windows` as it completes —
+    /// matches xdg-desktop-portal-cosmic's
+    /// `interactive_toplevel_images` which gathers per-output snapshots
+    /// in parallel via `FuturesUnordered`.
+    fn refresh_window_picker(&mut self) -> Task<Msg> {
+        self.windows.clear();
+        let with_cursor = self.rec_cursor;
+        let mut tasks: Vec<Task<Msg>> = Vec::new();
+        for info in self.outputs.values() {
+            tasks.push(self.spawn_picker_capture(info.name.clone(), with_cursor));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Kick off a per-output toplevel capture stream and deliver the
+    /// result through the picker subscription channel — same shape as
+    /// xdg-desktop-portal-cosmic's screenshot handler pushing onto its
+    /// tokio mpsc (`subscription.rs`). Falls back to a direct
+    /// `Task::perform` only if the subscription hasn't yet handed us the
+    /// sender (a launch-edge case; the subscription sends
+    /// `PickerChannelReady` on its first poll).
+    /// Kick off the per-output picker capture and deliver the result via
+    /// `Task::perform`. The result message lives inside iced's runtime so
+    /// it gets drained on completion without an external wakeup. We
+    /// previously tried a tokio::spawn → tokio mpsc → iced subscription
+    /// path; the captures completed in ~30ms but the messages sat for
+    /// >10s until the next input event because the tokio Waker doesn't
+    /// reach iced's wayland event loop (cross-runtime wakeup). The dummy
+    /// surface keeps iced warm, so the cold-start concern that drove the
+    /// subscription detour no longer applies.
+    fn spawn_picker_capture(&self, name: String, with_cursor: bool) -> Task<Msg> {
+        let helper = self.helper.clone();
+        let name_for_msg = name.clone();
+        Task::perform(
+            async move {
+                capture_toplevels_for_output(&helper, &name, with_cursor).await
+            },
+            move |entries| {
+                cosmic::action::app(Msg::WindowsForOutputReady(
+                    name_for_msg.clone(),
+                    entries,
+                ))
+            },
+        )
     }
 
     /// Open a fullscreen toolbar layer surface anchored to the given output if
@@ -999,7 +1242,7 @@ impl Panel {
             SaveTarget::Pictures => pipeline::screenshot::Destination::File(None),
             SaveTarget::Documents => {
                 let dest = dirs::document_dir().map(|d| {
-                    let stem = chrono::Local::now().format("cosmic-capture-%Y%m%d-%H%M%S");
+                    let stem = chrono::Local::now().format("Screenshot-%Y-%m-%d_%H-%M-%S");
                     d.join(format!("{stem}.png"))
                 });
                 pipeline::screenshot::Destination::File(dest)
@@ -1034,24 +1277,12 @@ impl Panel {
                 Mode::Screenshot => {
                     let destination = self.current_destination();
                     let notify_user = self.notify;
-                    // Window source delegates to xdg-desktop-portal's
-                    // interactive Screenshot — same approach cosmic-screenshot
-                    // takes. The portal handles freeze + window picking.
+                    // Window source has no toolbar primary action — capture
+                    // is driven by the user clicking a card in the fan-out
+                    // picker (see `view_window_picker`), which fires
+                    // `Msg::CaptureToplevel` directly.
                     if matches!(self.source, Source::Window) {
-                        // Tear down our toolbar surfaces before the portal
-                        // dialog appears, otherwise its dim background
-                        // composites under our exclusive-keyboard layer
-                        // surfaces and the portal becomes uninteractive.
-                        let close_bars = self.close_toolbars();
-                        self.capture = CaptureState::Saving;
-                        self.saving_started_at = Some(std::time::Instant::now());
-                        return Task::batch([
-                            close_bars,
-                            Task::perform(
-                                run_portal_screenshot(destination, notify_user),
-                                |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
-                            ),
-                        ]);
+                        return Task::none();
                     }
                     let Some(output_name) = self.active_output_name(clicked_output.as_deref())
                     else {
@@ -1143,6 +1374,138 @@ impl Panel {
             },
             CaptureState::Saving => Task::none(),
         }
+    }
+
+    /// Fan-out window picker — horizontal row of toplevel thumbnails, each
+    /// tile sized proportionally to the source window's pixel width. Click
+    /// a tile to capture that window. Mirrors xdg-desktop-portal-cosmic's
+    /// screenshot widget (`ScreenshotSelection` in Window choice mode):
+    /// `row(FillPortion(window_width/total_width)).align_y(Center)`.
+    ///
+    /// Renders only the toplevels the `WaylandHelper` reported sitting
+    /// on this output — same scoping the portal applies via its
+    /// `output_toplevels` map.
+    fn view_window_picker(&self, info: &OutputInfo) -> Element<'_, Msg> {
+        let on_this_output: &[WindowEntry] = self
+            .windows
+            .get(&info.name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        if on_this_output.is_empty() {
+            let label = if self.windows.contains_key(&info.name) {
+                "No windows on this display."
+            } else {
+                "Loading windows…"
+            };
+            return container(cosmic::widget::text::body(label))
+                .padding(24)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center)
+                .into();
+        }
+
+        // Direct port of xdg-desktop-portal-cosmic's `ScreenshotSelection`
+        // Window-choice branch in `widget/screenshot.rs`. The portal sets
+        // `content_fit(ScaleDown)` on the image and `width(FillPortion(..))`
+        // / `height(Shrink)` on the *container* (not the image), with a
+        // `layer_container` wrapper that paints the toolbar's component bg
+        // behind each tile.
+        let total_width: u64 = on_this_output.iter().map(|w| w.width.max(1) as u64).sum();
+        let total_width = total_width.max(1);
+
+        let img_buttons: Vec<Element<'_, Msg>> = on_this_output
+            .iter()
+            .map(|entry| {
+                let portion = ((entry.width.max(1) as u64 * u16::MAX as u64) / total_width)
+                    .max(1) as u16;
+                let id = entry.identifier.clone();
+                cosmic::widget::layer_container(
+                    button::custom(
+                        cosmic::iced::widget::image(entry.thumb.clone())
+                            .content_fit(cosmic::iced::ContentFit::ScaleDown),
+                    )
+                    .on_press(Msg::CaptureToplevel(id))
+                    .class(cosmic::theme::Button::Image),
+                )
+                .align_x(iced::Alignment::Center)
+                .width(Length::FillPortion(portion))
+                .height(Length::Shrink)
+                .into()
+            })
+            .collect();
+
+        cosmic::widget::layer_container(
+            iced::widget::Row::with_children(img_buttons)
+                .spacing(24)
+                .width(Length::Fill)
+                .align_y(iced::Alignment::Center)
+                .padding(24),
+        )
+        .align_x(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// Build the wallpaper background element for the Window-mode picker.
+    /// Same shape as xdg-desktop-portal-cosmic's `bg_element` match in
+    /// `widget/screenshot.rs`: a `Path` becomes a cover-fit Image; a
+    /// `Color::Single` becomes a solid-filled container; a
+    /// `Color::Gradient` becomes a linear-gradient container at the
+    /// configured radius. Returns `None` when no bg source is available
+    /// (cosmic-bg not running) so the caller can fall back to the freeze.
+    fn window_picker_bg<'a>(&self, info: &OutputInfo) -> Option<Element<'a, Msg>> {
+        use cosmic::iced::core::gradient::Linear;
+        use cosmic::iced::Degrees;
+        use cosmic_bg_config::{Color, Source};
+
+        let source = info.bg_source.as_ref()?;
+        let element: Element<'_, Msg> = match source {
+            Source::Path(path) => cosmic::iced::widget::image(
+                cosmic::iced::widget::image::Handle::from_path(path),
+            )
+            .content_fit(cosmic::iced::ContentFit::Cover)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+            Source::Color(color) => {
+                let color = color.clone();
+                container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .class(cosmic::theme::Container::Custom(Box::new(move |_| {
+                        let bg = match color.clone() {
+                            Color::Single(c) => Background::Color(
+                                cosmic::iced::Color::from_rgba(c[0], c[1], c[2], 1.0),
+                            ),
+                            Color::Gradient(g) => {
+                                let stops = g.colors.len().max(1);
+                                let stop_step = 1.0 / (stops.saturating_sub(1).max(1) as f32);
+                                let mut linear = Linear::new(Degrees(g.radius));
+                                let mut t = 0.0;
+                                for &[r, gc, b] in g.colors.iter() {
+                                    linear = linear.add_stop(
+                                        t,
+                                        cosmic::iced::Color::from_rgb(r, gc, b),
+                                    );
+                                    t += stop_step;
+                                }
+                                Background::Gradient(cosmic::iced::core::Gradient::Linear(linear))
+                            }
+                        };
+                        cosmic::iced::widget::container::Style {
+                            background: Some(bg),
+                            ..Default::default()
+                        }
+                    })))
+                    .into()
+            }
+        };
+        Some(element)
     }
 
     /// Compact pill shown while a recording is in progress. Just the Stop
@@ -1379,17 +1742,28 @@ impl Panel {
         let output_rect = output_rect_of(info);
         let mut stack = iced::widget::Stack::new();
 
-        // Frozen background — captured at toolbar-open time. Painted at the
-        // bottom of the stack so the selector + pill draw over it. While
-        // recording we suppress this (we want the live screen + recording
-        // border, not a stale frozen frame).
-        if pre_capture {
-            if let Some(handle) = info.frozen_handle.clone() {
-                let bg = cosmic::iced::widget::image(handle)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .content_fit(cosmic::iced::ContentFit::Fill);
-                stack = stack.push(Element::from(bg));
+        // Background painter. Source-specific to mirror
+        // xdg-desktop-portal-cosmic's `bg_element` switch:
+        //   * Region / Screen → frozen output capture (matches what the
+        //     user is about to crop/select).
+        //   * Window → the output's wallpaper (path or gradient/solid),
+        //     so the foreground toplevel tiles don't fight against a
+        //     duplicate of themselves drawn behind.
+        // Skipped entirely outside Screenshot mode and during Saving so
+        // Record shows the live screen.
+        if pre_capture && matches!(self.mode, Mode::Screenshot) {
+            let bg: Option<Element<'_, Msg>> = match self.source {
+                Source::Window => self.window_picker_bg(info),
+                Source::Region | Source::Screen => info.frozen_handle.clone().map(|handle| {
+                    cosmic::iced::widget::image(handle)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(cosmic::iced::ContentFit::Fill)
+                        .into()
+                }),
+            };
+            if let Some(bg) = bg {
+                stack = stack.push(bg);
             }
         }
 
@@ -1431,10 +1805,17 @@ impl Panel {
             }
         }
 
-        // Window source no longer needs a client-side picker in either mode:
-        // Screenshot uses the xdg-desktop-portal interactive Screenshot
-        // (cosmic-screenshot pattern) and Record uses the ScreenCast portal.
-        // Both portals own the window picker themselves.
+        // Screenshot+Window: render the fan-out picker on every toolbar
+        // (each output scopes the picker to its own toplevels). Matches
+        // xdg-desktop-portal-cosmic which opens one layer surface per
+        // output with that output's toplevel_images. Record+Window still
+        // delegates to the ScreenCast portal.
+        if pre_capture
+            && matches!(self.source, Source::Window)
+            && matches!(self.mode, Mode::Screenshot)
+        {
+            stack = stack.push(self.view_window_picker(info));
+        }
 
         stack.push(pill_layer).into()
     }
@@ -1659,15 +2040,18 @@ async fn run_screenshot(
         .map(path_to_string)
         .map_err(|e| format!("{:#}", e))
 }
-async fn run_portal_screenshot(
+async fn run_toplevel_screenshot(
+    identifier: String,
+    cursor: bool,
     destination: pipeline::screenshot::Destination,
     notify_user: bool,
 ) -> Result<String, String> {
-    pipeline::screenshot::capture_via_portal(destination, notify_user)
+    pipeline::screenshot::capture_toplevel(identifier, cursor, destination, notify_user)
         .await
         .map(path_to_string)
         .map_err(|e| format!("{:#}", e))
 }
+
 async fn run_save_frame(
     frame: CapturedFrame,
     crop: Option<CropRect>,
@@ -1679,28 +2063,60 @@ async fn run_save_frame(
         .map(path_to_string)
         .map_err(|e| format!("{:#}", e))
 }
-/// Serialize freeze captures across outputs. Multiple `screencopy::capture`
-/// calls running in parallel each open their own wayland connection and
-/// allocate their own shm pool; in practice that mix has produced glibc
-/// heap corruption on multi-monitor setups, so we funnel everything
-/// through one slot. The Mutex is async (Tokio) so it doesn't block the
-/// main event loop while a capture is in flight.
-static FREEZE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-async fn capture_output(
-    output_name: String,
+/// Capture one output's frozen frame via the persistent WaylandHelper.
+/// Replaces the prior `screencopy::capture` + `spawn_blocking` shape;
+/// the helper's dispatch thread drives the screencopy session on the
+/// shared connection, so concurrent captures don't open extra wayland
+/// connections (which is what produced the heap corruption that used
+/// to need a global lock).
+async fn capture_output_via_helper(
+    helper: &WaylandHelper,
+    output_name: &str,
     with_cursor: bool,
-) -> std::result::Result<Arc<CapturedFrame>, String> {
-    let _guard = FREEZE_LOCK.lock().await;
-    let target = screencopy::Target::OutputName(output_name.clone());
+) -> Option<Arc<CapturedFrame>> {
+    let output = helper.output_for_name(output_name)?;
     tracing::info!(output = %output_name, "freeze: capturing output");
-    let result = tokio::task::spawn_blocking(move || screencopy::capture(target, with_cursor))
-        .await
-        .map_err(|e| format!("capture task join: {e}"))?
-        .map(Arc::new)
-        .map_err(|e| format!("{e:#}"));
-    tracing::info!(output = %output_name, ok = result.is_ok(), "freeze: capture done");
-    result
+    let source = cosmic_client_toolkit::screencopy::CaptureSource::Output(output);
+    let frame = helper.capture_source_shm(source, with_cursor).await?;
+    Some(Arc::new(frame))
+}
+
+/// Drain the toplevel-image stream for a single output. Mirrors the
+/// portal's per-output `capture_output_toplevels_shm(...)` collect into
+/// `Vec<ScreenshotImage>`. Each yielded item already carries the
+/// identifier/title/app_id we need for picker labels.
+async fn capture_toplevels_for_output(
+    helper: &WaylandHelper,
+    output_name: &str,
+    with_cursor: bool,
+) -> Vec<WindowEntry> {
+    // Wait for cosmic-toplevel-info's initial batch to land before
+    // snapshotting `output_toplevels`. Without this, a refresh fired
+    // ~150ms after launch (e.g. persisted Source::Window) snapshots an
+    // empty map and the picker shows "No windows on this display"
+    // forever. The portal doesn't need this — its helper has been warm
+    // for the entire session by the time anyone opens its picker.
+    helper.wait_for_toplevel_info().await;
+    let Some(output) = helper.output_for_name(output_name) else {
+        return Vec::new();
+    };
+    use futures_util::StreamExt;
+    let stream = helper.capture_output_toplevels_shm(&output, with_cursor);
+    let captures: Vec<WindowCapture> = stream.collect().await;
+    captures
+        .into_iter()
+        .map(|c| {
+            let width = c.frame.width;
+            let thumb = frame_to_image_handle(&c.frame);
+            WindowEntry {
+                identifier: c.identifier,
+                title: c.title,
+                app_id: c.app_id,
+                thumb,
+                width,
+            }
+        })
+        .collect()
 }
 
 /// Repack a `CapturedFrame` (which may have row padding via `stride >
@@ -1723,6 +2139,41 @@ fn frame_to_image_handle(frame: &CapturedFrame) -> cosmic::iced::widget::image::
         out
     };
     cosmic::iced::widget::image::Handle::from_rgba(frame.width, frame.height, buf)
+}
+
+/// Read the wallpaper source configured for a given output. Mirrors
+/// xdg-desktop-portal-cosmic's lookup in
+/// `screenshot.rs::update_args` — pull `wallpapers: Vec<(String, Source)>`
+/// from the cosmic-bg state config, match by output name, fall back to
+/// the same default path the portal uses when none is set. Returns
+/// `None` only if the state config can't be opened at all (compositor
+/// without cosmic-bg).
+fn load_bg_for_output(name: &str) -> Option<cosmic_bg_config::Source> {
+    use cosmic::cosmic_config::CosmicConfigEntry;
+    let config = cosmic::cosmic_config::Config::new_state(
+        cosmic_bg_config::NAME,
+        cosmic_bg_config::state::State::version(),
+    )
+    .ok()?;
+    let state = match cosmic_bg_config::state::State::get_entry(&config) {
+        Ok(s) => s,
+        Err((err, partial)) => {
+            tracing::debug!(error = ?err, "cosmic-bg state read partial; using partial");
+            partial
+        }
+    };
+    Some(
+        state
+            .wallpapers
+            .iter()
+            .find(|(o, _)| o == name)
+            .map(|(_, src)| src.clone())
+            .unwrap_or_else(|| {
+                cosmic_bg_config::Source::Path(std::path::PathBuf::from(
+                    "/usr/share/backgrounds/cosmic/orion_nebula_nasa_heic0601a.jpg",
+                ))
+            }),
+    )
 }
 
 fn path_to_string(p: PathBuf) -> String {

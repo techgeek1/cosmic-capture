@@ -45,7 +45,7 @@ pub async fn record_with_crop(
 
     let path = paths::resolve(
         args.common.file.clone(),
-        paths::Kind::Video,
+        paths::Kind::Recording,
         args.container.extension(),
     )?;
 

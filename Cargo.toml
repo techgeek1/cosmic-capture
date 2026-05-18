@@ -36,7 +36,8 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable", "stagi
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop", "xkbcommon"] }
 cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086" }
-rustix = { version = "0.38", features = ["event"] }
+rustix = { version = "0.38", features = ["event", "fs"] }
+memmap2 = "0.9"
 
 # PNG encode + Wayland clipboard for the screenshot output paths.
 png = "0.17"
@@ -45,9 +46,13 @@ wl-clipboard-rs = "0.9"
 # COSMIC theme — used to pull the user's accent color for the selector border.
 cosmic-config = { git = "https://github.com/pop-os/libcosmic" }
 cosmic-theme = { git = "https://github.com/pop-os/libcosmic" }
+# COSMIC background config — read by the window picker to paint each
+# output's wallpaper (Path or gradient/solid Color) as the picker
+# backdrop, matching xdg-desktop-portal-cosmic's screenshot UI.
+cosmic-bg-config = { git = "https://github.com/pop-os/cosmic-bg" }
 
 # COSMIC GUI toolkit — for the pre-flight panel / HUD.
-libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = ["tokio", "wayland", "winit", "single-instance", "wgpu", "multi-window", "desktop"] }
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = ["tokio", "wayland", "winit", "wgpu", "multi-window", "desktop", "dbus-config"] }
 
 # GStreamer pipeline: appsrc/pipewiresrc + encoders + appsink. We feed
 # raw RGBA frames into appsrc ourselves via pipewire-rs so the recording
@@ -88,3 +93,20 @@ strip = "debuginfo"
 inherits = "release"
 debug = true
 strip = "none"
+
+# Compile wgpu/naga and related shader-handling crates with full
+# optimisations even in dev builds. Without this, iced's first frame
+# blocks for ~11s in `cargo run` while wgpu's shader pipeline finishes
+# (no internal events while it's working → every Task::perform message
+# — FrozenFrameReady, WindowsForOutputReady, …— sits in iced's queue
+# until that first frame renders). Release builds aren't affected.
+[profile.dev.package.wgpu]
+opt-level = 3
+[profile.dev.package.wgpu-core]
+opt-level = 3
+[profile.dev.package.wgpu-hal]
+opt-level = 3
+[profile.dev.package.wgpu-types]
+opt-level = 3
+[profile.dev.package.naga]
+opt-level = 3

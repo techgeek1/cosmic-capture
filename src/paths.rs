@@ -4,23 +4,30 @@ use anyhow::{Context, Result};
 use chrono::Local;
 
 pub enum Kind {
-    Image,
-    Video,
+    /// Still image — lands in `~/Pictures/Screenshots/Screenshot-<stamp>.<ext>`.
+    Screenshot,
+    /// Recording (video or animated GIF) — lands in
+    /// `~/Videos/Captures/Capture-<stamp>.<ext>`. GIF is a recording even
+    /// though its extension would suggest "image"; it has temporal content
+    /// and users look for it where they look for clips.
+    Recording,
 }
 
 pub fn resolve(user: Option<PathBuf>, kind: Kind, ext: &str) -> Result<PathBuf> {
     if let Some(p) = user {
         return Ok(p);
     }
-    let dir = match kind {
-        Kind::Image => dirs::picture_dir(),
-        Kind::Video => dirs::video_dir(),
-    }
-    .or_else(|| dirs::home_dir())
-    .context("could not locate home directory")?;
+    let (base, sub, prefix) = match kind {
+        Kind::Screenshot => (dirs::picture_dir(), "Screenshots", "Screenshot"),
+        Kind::Recording => (dirs::video_dir(), "Captures", "Capture"),
+    };
+    let dir = base
+        .or_else(dirs::home_dir)
+        .context("could not locate home directory")?
+        .join(sub);
     std::fs::create_dir_all(&dir).ok();
-    let stamp = Local::now().format("%Y%m%d-%H%M%S");
-    Ok(dir.join(format!("cosmic-capture-{stamp}.{ext}")))
+    let stamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+    Ok(dir.join(format!("{prefix}-{stamp}.{ext}")))
 }
 
 pub fn config_dir() -> Result<PathBuf> {

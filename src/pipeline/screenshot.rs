@@ -37,7 +37,7 @@ pub async fn run(args: ScreenshotArgs) -> Result<()> {
         return Ok(());
     }
 
-    let dest = paths::resolve(args.common.file.clone(), paths::Kind::Image, "png")?;
+    let dest = paths::resolve(args.common.file.clone(), paths::Kind::Screenshot, "png")?;
     encode_to_file(&frame, None, &dest)?;
     println!("{}", dest.display());
     if args.common.notify {
@@ -70,7 +70,7 @@ pub async fn capture_with(
             Ok(PathBuf::from("clipboard"))
         }
         Destination::File(user_path) => {
-            let dest = paths::resolve(user_path, paths::Kind::Image, "png")?;
+            let dest = paths::resolve(user_path, paths::Kind::Screenshot, "png")?;
             encode_to_file(&frame, crop, &dest)?;
             if notify_user {
                 if let Err(e) = notify::saved(&dest, "Screenshot").await {
@@ -104,79 +104,8 @@ pub async fn save_frame(
             Ok(PathBuf::from("clipboard"))
         }
         Destination::File(user_path) => {
-            let dest = paths::resolve(user_path, paths::Kind::Image, "png")?;
+            let dest = paths::resolve(user_path, paths::Kind::Screenshot, "png")?;
             encode_to_file(&frame, crop, &dest)?;
-            if notify_user {
-                if let Err(e) = notify::saved(&dest, "Screenshot").await {
-                    tracing::warn!(error = %e, "failed to send notification");
-                }
-            }
-            Ok(dest)
-        }
-    }
-}
-
-/// GUI entry — defer to xdg-desktop-portal's interactive Screenshot UI.
-/// Mirrors cosmic-screenshot's flow: the portal handles window/output/region
-/// picking and freezes the screen while the user chooses, so we don't have
-/// to reimplement that machinery on the client side.
-///
-/// The portal returns a `file://` URI pointing at a temp PNG it wrote. We
-/// either move that file to the user's destination or read it into the
-/// clipboard, depending on `destination`.
-pub async fn capture_via_portal(
-    destination: Destination,
-    notify_user: bool,
-) -> Result<PathBuf> {
-    use ashpd::desktop::screenshot::Screenshot;
-
-    let response = Screenshot::request()
-        .interactive(true)
-        .modal(true)
-        .send()
-        .await
-        .context("Screenshot portal send")?
-        .response()
-        .context("Screenshot portal response")?;
-    let uri = response.uri();
-    let src_path = match uri.scheme() {
-        "file" => uri
-            .to_file_path()
-            .map_err(|_| anyhow::anyhow!("portal returned non-local URI '{uri}'"))?,
-        scheme => anyhow::bail!("portal returned unsupported URI scheme '{scheme}'"),
-    };
-
-    match destination {
-        Destination::Clipboard => {
-            // Read the portal's temp PNG, drop the file, push bytes to the
-            // wayland clipboard. The portal's own temp lifetime is short, so
-            // we don't try to leave it behind.
-            let bytes =
-                fs::read(&src_path).with_context(|| format!("read {}", src_path.display()))?;
-            let _ = fs::remove_file(&src_path);
-            tokio::task::spawn_blocking(move || copy_bytes_to_clipboard(bytes, "image/png"))
-                .await
-                .map_err(|e| anyhow::anyhow!("clipboard task join: {e}"))??;
-            if notify_user {
-                let _ = notify::saved(std::path::Path::new("clipboard"), "Screenshot").await;
-            }
-            Ok(PathBuf::from("clipboard"))
-        }
-        Destination::File(user_path) => {
-            let dest = paths::resolve(user_path, paths::Kind::Image, "png")?;
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).ok();
-            }
-            // Same dev-vs-dev gymnastics as cosmic-screenshot: portal temp
-            // often lives in /tmp on a tmpfs while user picture dir is on
-            // disk, so rename across filesystems would EXDEV. Fall back to
-            // copy+remove in that case.
-            if let Err(e) = fs::rename(&src_path, &dest) {
-                tracing::debug!(error = %e, "rename failed, falling back to copy");
-                fs::copy(&src_path, &dest)
-                    .with_context(|| format!("copy {} → {}", src_path.display(), dest.display()))?;
-                let _ = fs::remove_file(&src_path);
-            }
             if notify_user {
                 if let Err(e) = notify::saved(&dest, "Screenshot").await {
                     tracing::warn!(error = %e, "failed to send notification");
@@ -209,7 +138,7 @@ pub async fn capture_toplevel(
             Ok(PathBuf::from("clipboard"))
         }
         Destination::File(user_path) => {
-            let dest = paths::resolve(user_path, paths::Kind::Image, "png")?;
+            let dest = paths::resolve(user_path, paths::Kind::Screenshot, "png")?;
             encode_to_file(&frame, None, &dest)?;
             if notify_user {
                 if let Err(e) = notify::saved(&dest, "Screenshot").await {

@@ -13,3 +13,4 @@ pub mod screencast;
 pub mod screencopy;
 pub mod screenshot;
 pub mod toplevels;
+pub mod wayland;

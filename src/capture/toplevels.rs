@@ -46,6 +46,12 @@ pub struct ToplevelSummary {
     pub identifier: String,
     pub title: String,
     pub app_id: String,
+    /// Output names the toplevel currently sits on (from cosmic-toplevel-
+    /// info's `output_enter` / `output_leave` events). Used by the GUI to
+    /// filter the window picker per output — xdg-desktop-portal-cosmic
+    /// only shows a window on the picker of the monitor it's actually on,
+    /// and we match that behaviour.
+    pub outputs: Vec<String>,
 }
 
 /// Enumerate all current toplevels. Blocking — run via `spawn_blocking`.
@@ -87,10 +93,18 @@ pub fn list() -> Result<Vec<ToplevelSummary>> {
     let mut out: Vec<ToplevelSummary> = data
         .toplevel_info_state
         .toplevels()
-        .map(|info| ToplevelSummary {
-            identifier: info.identifier.clone(),
-            title: info.title.clone(),
-            app_id: info.app_id.clone(),
+        .map(|info| {
+            let outputs: Vec<String> = info
+                .output
+                .iter()
+                .filter_map(|o| data.output_state.info(o).and_then(|i| i.name))
+                .collect();
+            ToplevelSummary {
+                identifier: info.identifier.clone(),
+                title: info.title.clone(),
+                app_id: info.app_id.clone(),
+                outputs,
+            }
         })
         .collect();
     out.sort_by(|a, b| a.title.cmp(&b.title));
@@ -154,7 +168,16 @@ pub fn capture(identifier: &str, with_cursor: bool) -> Result<CapturedFrame> {
         )
         .map_err(|e| anyhow!("screencopy create_session: {e:?}"))?;
 
+    // Bound the screencopy roundtrip so a toplevel that the compositor
+    // never responds for (closed mid-flight, restricted, unmapped) can't
+    // wedge the picker for the rest of the session. cosmic-comp normally
+    // satisfies a Toplevel capture in <50ms; 2s is generous and still
+    // bounded.
+    let cap_deadline = Instant::now() + Duration::from_secs(2);
     while result_slot.lock().unwrap().is_none() {
+        if Instant::now() >= cap_deadline {
+            bail!("screencopy timed out for toplevel {identifier:?}");
+        }
         q.blocking_dispatch(&mut data)
             .context("wayland blocking_dispatch")?;
     }
