@@ -14,7 +14,7 @@
 //!    routes by `window::Id`: the toolbar id renders the floating pill;
 //!    selector ids render the rectangle selector for the matching output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -40,14 +40,17 @@ use tokio::sync::oneshot;
 use wayland_client::protocol::wl_output::WlOutput;
 
 use crate::capture::screencopy::CapturedFrame;
+use crate::capture::toplevel_capture;
 use crate::capture::wayland::{WaylandHelper, WindowCapture};
 use crate::cli::{CommonArgs, GifArgs, RecordArgs, VideoContainer, VideoEncoder};
 use crate::encode::video::CropRect;
 use crate::pipeline;
 use crate::pipeline::record::ScreencopyTarget;
 
+use super::widget::streaming_thumb;
 use super::widget::{
-    DragSession, RectMode, RectangleSelection, SelectionEvent, SelectionRect,
+    DragSession, IntrinsicShader, RawFrame, RectMode, RectangleSelection, SelectionEvent,
+    SelectionRect, SharedFrame,
 };
 
 const APP_ID: &str = "com.system76.CosmicCapture";
@@ -227,12 +230,30 @@ struct OutputInfo {
     /// involves a stride-repack copy that we don't want to redo every
     /// frame.
     frozen_handle: Option<cosmic::iced::widget::image::Handle>,
+    /// Image-cache pin for `frozen_handle`. Set together with the
+    /// handle (post-`image::allocate`) so the swap is texture-ready on
+    /// the next frame, and held thereafter so iced's trim pass
+    /// doesn't evict the entry between renders.
+    #[allow(dead_code)]
+    frozen_alloc: Option<cosmic::iced::runtime::image::Allocation>,
     /// Output's wallpaper config — pulled from `cosmic_bg_config::state`
     /// on output discovery. Window-mode picker paints this as its
     /// background (path → image, color → solid/gradient) so the
     /// foreground toplevel tiles aren't competing with their own
     /// reflections in a frozen output capture.
     bg_source: Option<cosmic_bg_config::Source>,
+    /// Iced image-cache pin for the wallpaper handle. Filled
+    /// asynchronously on output discovery (`image::allocate` runs
+    /// concurrently with the rest of the init tasks); holding the
+    /// `Allocation` keeps the wgpu cache entry's strong_count > 0 so
+    /// the first picker entry doesn't pay a texture upload at the
+    /// moment the wallpaper layer enters the tree — which manifests as
+    /// a one-frame "stale freeze bg flash" where the unpopulated
+    /// wallpaper rect lets the frozen image behind it show through.
+    /// `None` for solid-color / gradient bg sources (no texture to
+    /// upload).
+    #[allow(dead_code)]
+    wallpaper_alloc: Option<cosmic::iced::runtime::image::Allocation>,
 }
 
 pub struct Panel {
@@ -304,6 +325,33 @@ pub struct Panel {
     /// `toplevel_images: HashMap<String, Vec<ScreenshotImage>>`. Filled
     /// in by the per-output stream from `WaylandHelper`.
     windows: HashMap<String, Vec<WindowEntry>>,
+    /// Reusable `SharedFrame` slots keyed by toplevel identifier. The
+    /// picker re-fetches entries on every mode/source toggle, but we
+    /// want the underlying wgpu texture to stay mapped across those
+    /// refreshes — recreating `SharedFrame`s with fresh ids would
+    /// force `ThumbPipeline` to allocate a new texture per refresh,
+    /// and the old ones would linger until `trim` (and flash visibly
+    /// on transition). Keeping one slot per identifier means a refresh
+    /// publishes fresh pixels into the same id; the existing texture
+    /// is reused and `queue.write_texture` lands on the next frame.
+    shared_frames: HashMap<String, Arc<SharedFrame>>,
+    /// Per-output "the picker has had a moment to paint" flag. Set
+    /// asynchronously a short delay after each `WindowsForOutputReady`
+    /// — long enough for iced to build the streaming-thumbnail wgpu
+    /// pipeline on first use and for `image::Handle::from_path` (the
+    /// wallpaper) to land its texture. Until this flips true for a
+    /// given output, we hold back both the wallpaper bg and the picker
+    /// layer; otherwise the wallpaper renders first, then tiles "pop
+    /// in" a frame later (the user's "BG flash"). Cleared when the
+    /// user leaves Source::Window or the output goes away.
+    picker_painted: HashSet<String>,
+    /// Per-toplevel streaming-thumbnail capture sessions, keyed by
+    /// `WindowEntry.identifier`. Each session is a continuous
+    /// `toplevel_capture::start` running at picker pace; the pump task
+    /// publishes frames into the matching `WindowEntry.streaming` slot
+    /// and pings the redraw bus. Dropping the `Capture` (e.g. when we
+    /// leave Source::Window or the window disappears) stops the loop.
+    streaming_sessions: HashMap<String, toplevel_capture::Capture>,
     /// Invisible 6x6 placeholder layer surface opened at startup. Direct
     /// port of `CosmicPortal::init`'s `dummy_id` surface
     /// (`xdg-desktop-portal-cosmic/src/app.rs`): with `no_main_window`
@@ -360,9 +408,16 @@ pub struct WindowEntry {
     /// `iced::runtime::image::allocate` after the entry first lands;
     /// `None` while the allocation task is in flight (initial render
     /// still pays one upload, but every subsequent toggle is a cache
-    /// hit).
+    /// hit). Unused once `streaming` takes over rendering, but retained
+    /// as a fallback for the pre-first-frame state.
     #[allow(dead_code)]
     alloc: Option<cosmic::iced::runtime::image::Allocation>,
+    /// Streaming-thumbnail publish slot. `Some` when a continuous
+    /// `toplevel_capture::start` session is feeding this tile; the
+    /// `StreamingThumb` widget reads from it directly during its wgpu
+    /// `prepare`. `None` before the session starts — the picker falls
+    /// back to the static `thumb` handle then.
+    streaming: Option<Arc<SharedFrame>>,
 }
 
 #[derive(Clone, Debug)]
@@ -381,20 +436,12 @@ pub enum Msg {
     /// Periodic tick during recording, fired by an `iced::time::every`
     /// subscription so the elapsed-time label on the stop pill keeps moving.
     Tick,
-    /// Periodic refresh of the window picker thumbnails. Fired by a
-    /// subscription while the user is sitting on Record + Window
-    /// (Idle, pre-capture) so the tiles update as window contents
-    /// change. Toplevel screencopy is cheap enough on cosmic-comp to
-    /// drive this at low single-digit Hz without saturating the
-    /// compositor.
-    LiveThumbnailRefresh,
-    /// Result of one per-toplevel re-capture, used by the live
-    /// thumbnail refresh path. `None` for a failed capture (the tile
-    /// keeps its previous image). Updates the matching entry in place
-    /// rather than replacing the whole `windows[output]` vec, so the
-    /// iced wgpu cache only churns one texture per arrival rather
-    /// than the full picker every tick.
-    SingleThumbRefresh(String, String, Option<CapturedFrame>),
+    /// Redraw nudge from the streaming-thumbnail pump tasks. Handler is
+    /// a no-op — the message itself is the signal that wakes iced and
+    /// triggers a redraw, which in turn drives the `StreamingThumb`
+    /// widget's `Primitive::prepare` so it can upload the newly-published
+    /// frame. See `widget/streaming_thumb.rs::nudge_redraw`.
+    ThumbDirty,
 
     ToggleClipboard,
 
@@ -416,6 +463,17 @@ pub enum Msg {
     /// optional because the helper returns `None` for screencopy
     /// failures.
     FrozenFrameReady(u32, Option<Arc<CapturedFrame>>),
+    /// `image::allocate` completed for a freshly-captured freeze. The
+    /// handle is now pinned in iced's wgpu image cache, so swapping it
+    /// into `info.frozen_handle` won't pay a first-frame upload — the
+    /// old handle keeps rendering until this lands, giving a stale →
+    /// new swap rather than an empty → new flash.
+    FrozenAllocated(
+        u32,
+        Arc<CapturedFrame>,
+        cosmic::iced::widget::image::Handle,
+        Option<cosmic::iced::runtime::image::Allocation>,
+    ),
     /// Per-output toplevel thumbnails arrived as a batch. Carries the
     /// output name (matched against `OutputInfo.name`) and the captured
     /// entries in stream order. Replaces the previous per-window
@@ -423,12 +481,25 @@ pub enum Msg {
     /// `capture_output_toplevels_shm` already streams sessions on the
     /// shared connection.
     WindowsForOutputReady(String, Vec<WindowEntry>),
+    /// Fired ~100ms after `WindowsForOutputReady` for a given output.
+    /// Marks the picker layer as "painted" so the wallpaper bg + tile
+    /// row can show together. Without this delay, the wallpaper renders
+    /// a frame before iced finishes building the streaming-thumb wgpu
+    /// pipeline on first use, producing a visible bg-then-tiles flash.
+    PickerPainted(String),
     /// `iced::widget::image::allocate` completed for `(output_name,
     /// index)`. The `Allocation` (if Some) pins the thumbnail's texture
     /// in the wgpu image cache so it doesn't get evicted when the
     /// picker leaves the widget tree (Region/Screen mode) and reupload
     /// on the next Window toggle.
     ThumbAllocated(String, usize, Option<cosmic::iced::runtime::image::Allocation>),
+    /// `iced::widget::image::allocate` result for an output's
+    /// wallpaper handle. Pre-uploading the texture before the picker
+    /// layer enters the widget tree prevents a one-frame race where
+    /// the empty wallpaper rect lets the frozen bg behind it show
+    /// through — the "stale background frame flash" the user sees on
+    /// first picker entry per output.
+    WallpaperAllocated(u32, Option<cosmic::iced::runtime::image::Allocation>),
     /// User clicked a window card → capture that window full-res and save.
     CaptureToplevel(String),
     Quit,
@@ -485,6 +556,9 @@ impl Application for Panel {
             cancel_pending: false,
             hovered_toolbar: None,
             windows: HashMap::new(),
+            shared_frames: HashMap::new(),
+            picker_painted: HashSet::new(),
+            streaming_sessions: HashMap::new(),
             helper,
             dummy_id,
         };
@@ -524,29 +598,45 @@ impl Application for Panel {
                     let mut tasks: Vec<Task<Msg>> = Vec::new();
                     match m {
                         Mode::Screenshot => {
-                            // Force-refresh BOTH freeze backgrounds and
-                            // window thumbnails so the snapshot the user
-                            // sees (freeze + window tiles) is taken from
-                            // the same wall-clock instant. The earlier
-                            // logic skipped already-frozen outputs and
-                            // never touched the window picker on mode
-                            // swaps, which left the two views out of
-                            // sync — fine when the user just toggled
-                            // back and forth, but visibly wrong on a
-                            // fresh Screenshot entry after a recording
-                            // session.
-                            tasks.push(self.force_refresh_output_freezes());
+                            // Leaving Record mode — drop any streaming
+                            // thumbnail sessions; Screenshot wants the
+                            // frozen view, not live frames.
+                            self.stop_all_stream_sessions();
+                            // Deliberately keep `picker_painted` set if
+                            // it already is. While we re-fetch entries
+                            // async, the existing static-thumbnail
+                            // tiles stay visible so the picker view
+                            // doesn't flicker back to "normal screen"
+                            // during a Record↔Screenshot swap. New
+                            // entries replace in place via
+                            // `windows.insert` once they land.
+                            // NOTE: we deliberately *don't* refresh the
+                            // output freezes here. The freezes captured
+                            // on `Output::Created` are pre-allocated
+                            // and pinned via `frozen_alloc`; replacing
+                            // them mid-session causes iced's renderer
+                            // to swap to a fresh handle whose first
+                            // sample races the upload, and the live
+                            // desktop bleeds through for a frame on the
+                            // next source change. The trade-off is
+                            // staleness — Region/Screen show the
+                            // screen as it was at app start — which is
+                            // acceptable for selection framing since
+                            // the actual capture is always live.
                             if matches!(self.source, Source::Window) {
                                 tasks.push(self.force_refresh_window_picker());
                             }
                         }
                         Mode::Record => {
-                            // Drop frozen-output captures so the next
-                            // Screenshot entry re-captures fresh state.
-                            for info in self.outputs.values_mut() {
-                                info.frozen = None;
-                                info.frozen_handle = None;
-                            }
+                            // Keep existing frozen captures around as a
+                            // stale fallback for the next Screenshot
+                            // entry. Screenshot mode no longer
+                            // refreshes freezes on mode/source changes
+                            // (re-capture would race iced's renderer
+                            // and also bake any open overlays — picker,
+                            // toolbar — into the freeze), so the
+                            // capture from `Output::Created` is the
+                            // canonical clean version.
                             // Window thumbnails are also frozen
                             // snapshots; in Record mode the user is
                             // about to capture live action against
@@ -554,6 +644,8 @@ impl Application for Panel {
                             // toolbar-open snapshot is the wrong
                             // affordance — refresh on each entry so the
                             // tiles match the current window contents.
+                            // (Deliberately keep `picker_painted` so the
+                            // picker view persists across the swap.)
                             if matches!(self.source, Source::Window) {
                                 tasks.push(self.force_refresh_window_picker());
                             }
@@ -569,17 +661,31 @@ impl Application for Panel {
                     self.source = s;
                     self.persist("source", &s);
                     if matches!(s, Source::Window) {
-                        // Force a fresh capture every time the user
-                        // enters Window source so the tiles match
-                        // "right now". For Screenshot mode also re-fire
-                        // the output freezes so the freeze background
-                        // behind the tiles is synchronized with them.
-                        let mut tasks: Vec<Task<Msg>> = Vec::new();
-                        tasks.push(self.force_refresh_window_picker());
-                        if matches!(self.mode, Mode::Screenshot) {
-                            tasks.push(self.force_refresh_output_freezes());
-                        }
-                        return Task::batch(tasks);
+                        // Force a fresh picker capture so tiles match
+                        // "right now". We deliberately *don't* refresh
+                        // the output freezes here even in Screenshot
+                        // mode — screencopy includes our own layer
+                        // surfaces (toolbar pill, picker bg, etc.) so
+                        // re-capturing while the picker is open bakes
+                        // the picker overlay into the freeze, which
+                        // then shows through when the user switches
+                        // back to Region/Screen. The freeze captured
+                        // at `Output::Created` (before any overlay was
+                        // painted) is the clean version; keep it.
+                        return self.force_refresh_window_picker();
+                    } else {
+                        // Leaving Window source — stop all streaming
+                        // sessions so we're not paying screencopy
+                        // overhead on toplevels the user can't see.
+                        // Deliberately keep `picker_painted` set: on
+                        // re-entry to Source::Window the wallpaper +
+                        // tile row should appear immediately with the
+                        // last-known entries (refreshed in place when
+                        // the new captures land) rather than falling
+                        // back to the "frozen alone" loading state for
+                        // 100ms+ per round-trip, which flickers
+                        // visibly when the user toggles
+                        // Region↔Window in Screenshot mode.
                     }
                 }
             }
@@ -635,7 +741,9 @@ impl Application for Panel {
                                 recording_id: None,
                                 frozen: None,
                                 frozen_handle: None,
+                                frozen_alloc: None,
                                 bg_source,
+                                wallpaper_alloc: None,
                             },
                         );
                         // Don't `prune_stale_region` here: outputs arrive
@@ -655,10 +763,14 @@ impl Application for Panel {
                         let open = self.ensure_toolbar_for(key);
                         let with_cursor = self.rec_cursor;
                         let mut tasks = vec![open];
-                        // Freeze background — Screenshot only. Record
-                        // shows the live screen so users can frame the
-                        // action they're about to record.
-                        if matches!(self.mode, Mode::Screenshot) {
+                        // Freeze background — captured unconditionally
+                        // so a later Mode::Screenshot entry doesn't pay
+                        // a visible "transparent until freeze lands"
+                        // gap. The view only paints this in Screenshot
+                        // mode (gated on `self.mode` at render time),
+                        // so Record users never see it; we just hold it
+                        // in memory for the eventual mode swap.
+                        {
                             let helper = self.helper.clone();
                             let name_for_freeze = name_for_capture.clone();
                             tasks.push(Task::perform(
@@ -681,6 +793,27 @@ impl Application for Panel {
                         if matches!(self.source, Source::Window) {
                             let picker_name = name_for_capture.clone();
                             tasks.push(self.spawn_picker_capture(picker_name, with_cursor));
+                        }
+                        // Pre-allocate the wallpaper texture so the
+                        // first picker entry doesn't pay a per-frame
+                        // upload at the moment the wallpaper layer
+                        // enters the tree. Only meaningful for
+                        // path-backed wallpapers — solid/gradient
+                        // sources don't go through an image cache.
+                        if let Some(cosmic_bg_config::Source::Path(path)) =
+                            self.outputs.get(&key).and_then(|o| o.bg_source.clone())
+                        {
+                            let handle =
+                                cosmic::iced::widget::image::Handle::from_path(path);
+                            tasks.push(
+                                cosmic::iced::runtime::image::allocate(handle)
+                                    .map(move |r: Result<_, _>| {
+                                        cosmic::action::app(Msg::WallpaperAllocated(
+                                            key,
+                                            r.ok(),
+                                        ))
+                                    }),
+                            );
                         }
                         if tasks.len() == 1 {
                             return tasks.pop().unwrap();
@@ -714,6 +847,7 @@ impl Application for Panel {
                             // a reattached output reappears with the
                             // same name we want a fresh capture.
                             self.windows.remove(&info.name);
+                            self.picker_painted.remove(&info.name);
                             let mut tasks: Vec<Task<Msg>> = Vec::new();
                             if let Some(id) = info.toolbar_id {
                                 tasks.push(destroy_layer_surface(id));
@@ -757,18 +891,11 @@ impl Application for Panel {
                 self.persist("last_region", &Option::<SelectionRect>::None);
             }
 
-            Msg::LiveThumbnailRefresh => {
-                // Intentionally a no-op. Live thumbnails are deferred
-                // until we have a streaming-texture widget (see
-                // project_todo_streaming_window_thumbnails.md). Polling
-                // + Handle::from_rgba causes iced to churn the wgpu
-                // texture cache every tick — visible as a full-picker
-                // flash even with per-tile updates, because each new
-                // Handle is a fresh cache key and image::allocate's
-                // pinning doesn't help across IDs.
-            }
-            Msg::SingleThumbRefresh(_, _, _) => {
-                // Parked alongside LiveThumbnailRefresh — see above.
+            Msg::ThumbDirty => {
+                // No-op. Receipt of the message itself wakes iced and
+                // triggers a redraw, which is all the streaming-thumbnail
+                // pump tasks need. Frame data already lives in the
+                // shared slot the `StreamingThumb` widget reads from.
             }
 
             Msg::Tick => {
@@ -903,6 +1030,7 @@ impl Application for Panel {
                 // picker thumbnail every cycle (see `WindowEntry.alloc`
                 // docstring).
                 let mut allocate_tasks: Vec<Task<Msg>> = Vec::new();
+                let mut entries = entries;
                 for (i, entry) in entries.iter().enumerate() {
                     let name_for_msg = output_name.clone();
                     allocate_tasks.push(
@@ -916,10 +1044,75 @@ impl Application for Panel {
                             }),
                     );
                 }
-                self.windows.insert(output_name, entries);
-                if !allocate_tasks.is_empty() {
-                    return Task::batch(allocate_tasks);
+                // Assign each entry a `SharedFrame` slot from the
+                // process-wide pool, keyed by toplevel identifier. If
+                // a slot already exists (because we've shown this
+                // toplevel in a prior refresh), reuse it — the
+                // `ThumbPipeline` wgpu texture mapped to that slot's
+                // id stays valid across refreshes, so we only pay the
+                // upload cost once per toplevel rather than per
+                // refresh. Either way, publish the fresh pixels into
+                // the slot so the next prepare uploads the new frame.
+                for entry in entries.iter_mut() {
+                    let shared = self
+                        .shared_frames
+                        .entry(entry.identifier.clone())
+                        .or_insert_with(SharedFrame::new)
+                        .clone();
+                    shared.publish(RawFrame {
+                        pixels: entry.frozen.pixels.clone(),
+                        width: entry.frozen.width,
+                        height: entry.frozen.height,
+                        stride: entry.frozen.stride,
+                    });
+                    entry.streaming = Some(shared);
                 }
+                // Record mode: attach a continuous capture pump on top
+                // of the reused slot. Screenshot mode leaves the slot
+                // static, frozen on the last published pixels.
+                if matches!(self.source, Source::Window)
+                    && matches!(self.mode, Mode::Record)
+                {
+                    for entry in entries.iter_mut() {
+                        if let Some(shared) = entry.streaming.clone() {
+                            let ident = entry.identifier.clone();
+                            self.attach_stream_to(&ident, shared);
+                        }
+                    }
+                }
+                // Prune `shared_frames` slots that no toplevel
+                // references anymore. After insert, sweep against the
+                // union of all currently-known identifiers across
+                // every output's entries.
+                let live: HashSet<&str> = self
+                    .windows
+                    .values()
+                    .flat_map(|v| v.iter().map(|e| e.identifier.as_str()))
+                    .chain(entries.iter().map(|e| e.identifier.as_str()))
+                    .collect();
+                self.shared_frames
+                    .retain(|ident, _| live.contains(ident.as_str()));
+                self.windows.insert(output_name.clone(), entries);
+                // Schedule the "picker painted" flip ~100ms out, long
+                // enough for iced to build our streaming-thumb wgpu
+                // pipeline on first use and for the wallpaper image
+                // texture to land. View gates wallpaper + picker layer
+                // on this so both appear together rather than wallpaper
+                // first then tiles popping in.
+                let painted_name = output_name;
+                let paint_settled: Task<Msg> = Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        painted_name
+                    },
+                    |n| cosmic::action::app(Msg::PickerPainted(n)),
+                );
+                let mut all = allocate_tasks;
+                all.push(paint_settled);
+                return Task::batch(all);
+            }
+            Msg::PickerPainted(output_name) => {
+                self.picker_painted.insert(output_name);
             }
             Msg::ThumbAllocated(output_name, idx, alloc) => {
                 if let Some(entries) = self.windows.get_mut(&output_name) {
@@ -928,10 +1121,20 @@ impl Application for Panel {
                     }
                 }
             }
+            Msg::WallpaperAllocated(key, alloc) => {
+                if let Some(info) = self.outputs.get_mut(&key) {
+                    info.wallpaper_alloc = alloc;
+                }
+            }
             Msg::CaptureToplevel(identifier) => {
                 if !matches!(self.capture, CaptureState::Idle) {
                     return Task::none();
                 }
+                // About to capture / record this toplevel — tear down
+                // every streaming-thumbnail session so the picker
+                // sessions don't fight the recording session for the
+                // same toplevel's screencopy queue.
+                self.stop_all_stream_sessions();
                 // Raise + focus the picked toplevel before tearing down
                 // the picker. cosmic-screencopy is happy to capture a
                 // minimized/background window, but the user's clicked it
@@ -1034,21 +1237,42 @@ impl Application for Panel {
             }
 
             Msg::FrozenFrameReady(key, result) => {
-                let Some(info) = self.outputs.get_mut(&key) else {
+                if self.outputs.get(&key).is_none() {
+                    return Task::none();
+                }
+                let Some(frame) = result else {
+                    tracing::warn!(
+                        key,
+                        "freeze capture returned None; toolbar will run live-screen"
+                    );
                     return Task::none();
                 };
-                match result {
-                    Some(frame) => {
-                        let handle = frame_to_image_handle(&frame);
-                        info.frozen = Some(frame);
-                        info.frozen_handle = Some(handle);
-                    }
-                    None => {
-                        tracing::warn!(
-                            output = %info.name,
-                            "freeze capture returned None; toolbar will run live-screen"
-                        );
-                    }
+                // Build the handle but don't swap it into OutputInfo
+                // yet — pre-allocate first so the swap is texture-ready
+                // on the very next frame. Without this, the old handle
+                // gets replaced atomically but the new one's wgpu cache
+                // entry doesn't exist yet, producing a one-frame empty
+                // rect that lets whatever's underneath flash through
+                // (the "stale background flash" the user sees on
+                // Record→Screenshot transitions where freezes refresh).
+                let handle = frame_to_image_handle(&frame);
+                let handle_for_msg = handle.clone();
+                return cosmic::iced::runtime::image::allocate(handle.clone()).map(
+                    move |r: Result<_, _>| {
+                        cosmic::action::app(Msg::FrozenAllocated(
+                            key,
+                            frame.clone(),
+                            handle_for_msg.clone(),
+                            r.ok(),
+                        ))
+                    },
+                );
+            }
+            Msg::FrozenAllocated(key, frame, handle, alloc) => {
+                if let Some(info) = self.outputs.get_mut(&key) {
+                    info.frozen = Some(frame);
+                    info.frozen_handle = Some(handle);
+                    info.frozen_alloc = alloc;
                 }
             }
 
@@ -1232,10 +1456,14 @@ impl Application for Panel {
         } else {
             Subscription::none()
         };
-        // Live thumbnail subscription removed — see
-        // project_todo_streaming_window_thumbnails.md. Polling +
-        // Handle::from_rgba flashes the whole picker every tick.
-        Subscription::batch([outputs, keys, pointer, tick])
+        // Streaming-thumbnail redraw bridge: the per-tile pump tasks
+        // publish into shared frame slots and ping a global mpsc; this
+        // subscription forwards each ping as `Msg::ThumbDirty`, which
+        // wakes iced just enough to redraw the picker and run the
+        // shader widget's `Primitive::prepare` (where the new frame
+        // actually gets uploaded into the long-lived wgpu texture).
+        let thumbs = Subscription::run(thumb_redraw_stream);
+        Subscription::batch([outputs, keys, pointer, tick, thumbs])
     }
 }
 
@@ -1291,27 +1519,6 @@ impl Panel {
         Task::batch(tasks)
     }
 
-    /// Re-capture freeze backgrounds for every output. Used together
-    /// with `force_refresh_window_picker` so the picker thumbnails and
-    /// the underlying freeze line up at the same wall-clock instant —
-    /// the user's complaint was that the window thumbnails were from a
-    /// different moment than the frozen background behind them.
-    fn force_refresh_output_freezes(&mut self) -> Task<Msg> {
-        let with_cursor = self.rec_cursor;
-        let mut tasks: Vec<Task<Msg>> = Vec::new();
-        for (&key, info) in self.outputs.iter() {
-            let helper = self.helper.clone();
-            let name = info.name.clone();
-            tasks.push(Task::perform(
-                async move {
-                    capture_output_via_helper(&helper, &name, with_cursor).await
-                },
-                move |r| cosmic::action::app(Msg::FrozenFrameReady(key, r)),
-            ));
-        }
-        Task::batch(tasks)
-    }
-
     /// Kick off a per-output toplevel capture stream and deliver the
     /// result through the picker subscription channel — same shape as
     /// xdg-desktop-portal-cosmic's screenshot handler pushing onto its
@@ -1342,6 +1549,104 @@ impl Panel {
                 ))
             },
         )
+    }
+
+    /// Attach a continuous toplevel-capture pump to an existing
+    /// `SharedFrame`. The slot is expected to already be seeded by the
+    /// initial picker capture (`capture_toplevels_for_output`), so the
+    /// widget always has something to render; this just adds the
+    /// stream that pushes fresh frames into the same slot. Records the
+    /// underlying `Capture` in `self.streaming_sessions`; dropping the
+    /// panel (or stopping all sessions) tears it down. Idempotent per
+    /// identifier.
+    fn attach_stream_to(&mut self, identifier: &str, shared: Arc<SharedFrame>) {
+        if self.streaming_sessions.contains_key(identifier) {
+            return;
+        }
+
+        // ~30fps cap on the producer; iced still redraws only on the
+        // bus pings the pump emits, so the cadence is the slower of
+        // (compositor rate, this cap) — i.e. always compositor-paced
+        // for typical toplevels.
+        let (capture, fmt_rx, mut frame_rx) = match toplevel_capture::start(
+            self.helper.clone(),
+            identifier.to_string(),
+            false,
+            30,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(identifier, error = %e,
+                    "streaming_thumb: failed to start toplevel capture");
+                return;
+            }
+        };
+
+        let shared_for_pump = shared.clone();
+        // Pump task: wait for the first format announce so we know
+        // width/height/stride for each frame, then forward frames into
+        // the shared slot. The capture loop pads rows via `stride`, so
+        // we must pass that through — the widget's `write_texture` honors
+        // it. Exits when the producer drops (Capture dropped → task
+        // aborted → fmt_rx / frame_rx return None).
+        tokio::spawn(async move {
+            let fmt = match fmt_rx.await {
+                Ok(f) => f,
+                Err(_) => {
+                    tracing::debug!("streaming_thumb pump: fmt_rx closed before first frame");
+                    return;
+                }
+            };
+            let (width, height, stride) = (fmt.width, fmt.height, fmt.stride);
+            let expected = (stride as usize) * (height as usize);
+            while let Some(frame) = frame_rx.recv().await {
+                // The producer always emits `stride * height` bytes per
+                // frame at the negotiated format. A toplevel resize
+                // tears the session — we'd see a new fmt on the next
+                // start; until that's wired, skip torn frames rather
+                // than upload undersized pixels.
+                if frame.bytes.len() < expected {
+                    tracing::trace!(
+                        len = frame.bytes.len(),
+                        expected,
+                        "streaming_thumb pump: short frame, skipping"
+                    );
+                    continue;
+                }
+                shared_for_pump.publish(RawFrame {
+                    pixels: frame.bytes,
+                    width,
+                    height,
+                    stride,
+                });
+                streaming_thumb::nudge_redraw();
+            }
+            tracing::debug!("streaming_thumb pump: frame_rx closed, exiting");
+        });
+
+        self.streaming_sessions
+            .insert(identifier.to_string(), capture);
+    }
+
+    /// Stop every active toplevel-capture pump. Used when the user
+    /// leaves Source::Window (pumps are pure screencopy overhead
+    /// off-picker), enters Screenshot mode (Screenshot wants the
+    /// frozen view, not live frames), or is about to start a
+    /// recording (the recording session needs the toplevel's
+    /// screencopy queue to itself). Dropping each `Capture` signals
+    /// its loop to stop and aborts the tokio task. Each tile's
+    /// `SharedFrame` is left in place — it's still the picker's
+    /// render source via `IntrinsicShader`, just frozen on whatever
+    /// frame was last published.
+    fn stop_all_stream_sessions(&mut self) {
+        if self.streaming_sessions.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            count = self.streaming_sessions.len(),
+            "streaming_thumb: stopping all sessions"
+        );
+        self.streaming_sessions.clear();
     }
 
     /// Open a fullscreen toolbar layer surface anchored to the given output if
@@ -1982,13 +2287,31 @@ impl Panel {
                 let portion = ((entry.width.max(1) as u64 * u16::MAX as u64) / total_width)
                     .max(1) as u16;
                 let id = entry.identifier.clone();
-                cosmic::widget::layer_container(
-                    button::custom(
-                        cosmic::iced::widget::image(entry.thumb.clone())
-                            .content_fit(cosmic::iced::ContentFit::ScaleDown),
+                // Always `IntrinsicShader`, in both modes. The
+                // `SharedFrame` is seeded with the initial capture at
+                // `WindowEntry` construction time so the widget has
+                // pixels to render from the first frame; Record mode
+                // additionally attaches a stream pump that publishes
+                // fresh frames into the same slot. Using one render
+                // path for both modes avoids iced's image-atlas
+                // first-frame upload race that produces the flash
+                // when fresh `Handle::from_rgba` thumbs land in
+                // Screenshot mode.
+                let inner: Element<'_, Msg> = match entry.streaming.clone() {
+                    Some(shared) => IntrinsicShader::new(
+                        shared,
+                        entry.frozen.width,
+                        entry.frozen.height,
                     )
-                    .on_press(Msg::CaptureToplevel(id))
-                    .class(cosmic::theme::Button::Image),
+                    .into(),
+                    None => cosmic::iced::widget::image(entry.thumb.clone())
+                        .content_fit(cosmic::iced::ContentFit::ScaleDown)
+                        .into(),
+                };
+                cosmic::widget::layer_container(
+                    button::custom(inner)
+                        .on_press(Msg::CaptureToplevel(id))
+                        .class(cosmic::theme::Button::Image),
                 )
                 .align_x(iced::Alignment::Center)
                 .width(Length::FillPortion(portion))
@@ -2328,6 +2651,39 @@ impl Panel {
         // The fix here is to make the frozen bg unconditional in
         // Screenshot mode — present in every Source's tree — so it's
         // never the texture that gets evicted on a toggle.
+        // Per-output picker tile readiness. The wallpaper bg + picker
+        // layer should appear together; both need to be GPU-ready
+        // before we expose them, or the transition shows live desktop
+        // for a frame. We require BOTH:
+        //   * `picker_painted` — set ~100ms after `WindowsForOutputReady`
+        //     so the `IntrinsicShader` wgpu pipeline is warm and tile
+        //     textures are uploaded into `ThumbPipeline`.
+        //   * `wallpaper_alloc` — `image::allocate` finished for this
+        //     output's wallpaper, so the bg image is pinned in iced's
+        //     atlas and won't race on first sample.
+        // For non-Window sources both checks are bypassed; the frozen
+        // bg has its own readiness gate (`frozen_alloc`).
+        // For path wallpapers we need `image::allocate` to land before
+        // the bg is texture-ready. Color / gradient sources go through
+        // a `container` widget with no texture upload, so they're
+        // always ready; same for outputs with no wallpaper at all
+        // (cosmic-bg not running).
+        let wallpaper_ready = match info.bg_source.as_ref() {
+            Some(cosmic_bg_config::Source::Path(_)) => info.wallpaper_alloc.is_some(),
+            _ => true,
+        };
+        let tiles_ready = !matches!(self.source, Source::Window)
+            || (self.picker_painted.contains(&info.name) && wallpaper_ready);
+
+        // Frozen bg is the backdrop for Region/Screen sources in
+        // Screenshot mode. We deliberately skip it in Source::Window —
+        // Record mode does the same (its gate is just Mode::Screenshot
+        // anyway), and matching that here avoids the "stale freeze
+        // flashes through unloaded wallpaper" issue: the frozen layer
+        // sits underneath wallpaper, so any single-frame race in the
+        // wallpaper's texture upload exposes the freeze. With no
+        // frozen layer under the picker, the worst case is a
+        // transparent flash to live desktop, identical to Record mode.
         if pre_capture
             && matches!(self.mode, Mode::Screenshot)
             && !matches!(self.source, Source::Window)
@@ -2341,7 +2697,7 @@ impl Panel {
                 );
             }
         }
-        if pre_capture && matches!(self.source, Source::Window) {
+        if pre_capture && matches!(self.source, Source::Window) && tiles_ready {
             if let Some(bg) = self.window_picker_bg(info) {
                 stack = stack.push(bg);
             }
@@ -2392,7 +2748,7 @@ impl Panel {
         // toplevel_images. Clicking a tile fires `Msg::CaptureToplevel`,
         // which routes by mode: Screenshot → one-shot save; Record →
         // start continuous toplevel-screencopy recording.
-        if pre_capture && matches!(self.source, Source::Window) {
+        if pre_capture && matches!(self.source, Source::Window) && tiles_ready {
             stack = stack.push(self.view_window_picker(info));
         }
 
@@ -2631,6 +2987,35 @@ fn record_button<'a>(
         .on_press_maybe(press)
 }
 
+/// Build the stream that backs the streaming-thumbnail redraw
+/// subscription. Takes the redraw receiver out of the global bus exactly
+/// once and forwards each ping as a `Msg::ThumbDirty`. `Subscription::run`
+/// only invokes this fn once per identity (a stable function pointer), so
+/// the one-shot `take_redraw_receiver` lines up with iced's subscription
+/// lifecycle. If the bus is already taken (shouldn't happen — there's
+/// one subscription per app), we park forever so iced doesn't see a
+/// stream-end and drop us.
+fn thumb_redraw_stream() -> impl iced::futures::Stream<Item = Msg> {
+    iced::stream::channel(64, async |mut sender| {
+        let Some(mut rx) = streaming_thumb::take_redraw_receiver() else {
+            tracing::warn!(
+                "thumb_redraw_stream: redraw receiver already taken — \
+                 parking subscription"
+            );
+            std::future::pending::<()>().await;
+            return;
+        };
+        while let Some(()) = rx.recv().await {
+            if sender.try_send(Msg::ThumbDirty).is_err() {
+                // Channel full or closed. If full, the consumer is
+                // already behind on redraws and we don't need to pile
+                // on. If closed, iced has dropped us; loop will exit
+                // next iter when `recv()` returns None.
+            }
+        }
+    })
+}
+
 async fn run_screenshot(
     output_name: String,
     cursor: bool,
@@ -2736,6 +3121,9 @@ async fn capture_toplevels_for_output(
         .map(|c| {
             let width = c.frame.width;
             let thumb = frame_to_image_handle(&c.frame);
+            // `streaming` is filled in by the handler (which owns
+            // `shared_frames`) so the `SharedFrame` id stays stable
+            // across picker refreshes for the same toplevel identifier.
             WindowEntry {
                 identifier: c.identifier,
                 title: c.title,
@@ -2744,6 +3132,7 @@ async fn capture_toplevels_for_output(
                 frozen: Arc::new(c.frame),
                 width,
                 alloc: None,
+                streaming: None,
             }
         })
         .collect()
