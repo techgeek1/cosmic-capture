@@ -16,12 +16,14 @@ use std::thread;
 use anyhow::{Context, Result};
 use tokio::sync::Notify;
 use cosmic_client_toolkit::{
+    cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
     screencopy::{
         CaptureFrame, CaptureOptions, CaptureSession, CaptureSource, Capturer, FailureReason,
         Formats, Frame, ScreencopyFrameData, ScreencopyFrameDataExt, ScreencopyHandler,
         ScreencopySessionData, ScreencopySessionDataExt, ScreencopyState,
     },
     toplevel_info::{ToplevelInfo, ToplevelInfoHandler, ToplevelInfoState},
+    toplevel_management::{ToplevelManagerHandler, ToplevelManagerState},
     workspace::{WorkspaceHandler, WorkspaceState},
 };
 use futures_util::stream::{FuturesOrdered, Stream, StreamExt};
@@ -29,13 +31,14 @@ use tokio::sync::oneshot;
 use smithay_client_toolkit::{
     output::{OutputHandler, OutputInfo, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
+    seat::{Capability, SeatHandler, SeatState},
     shm::{Shm, ShmHandler},
 };
 use std::os::fd::{AsFd, OwnedFd};
 use wayland_client::{
     Connection, QueueHandle, WEnum, delegate_noop,
     globals::registry_queue_init,
-    protocol::{wl_buffer, wl_output, wl_shm, wl_shm_pool},
+    protocol::{wl_buffer, wl_output, wl_seat, wl_shm, wl_shm_pool},
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1;
@@ -88,6 +91,17 @@ struct WaylandHelperInner {
     /// wait_for_toplevel_info()` before snapshotting.
     info_done: AtomicBool,
     info_done_notify: Notify,
+    /// `wl_seat` handles for `activate_toplevel`. cosmic-comp's
+    /// toplevel-management `activate` request takes both a toplevel and a
+    /// seat (it scopes the focus change to the seat that asked). We track
+    /// every seat the registry advertises and use the first one — most
+    /// installations have exactly one seat.
+    seats: Mutex<Vec<wl_seat::WlSeat>>,
+    /// `Some` when cosmic-comp advertises the unstable
+    /// `zcosmic_toplevel_manager_v1` global, `None` otherwise (e.g.
+    /// vanilla Wayland compositors). Activate is a best-effort hint
+    /// either way — we silently no-op when unavailable.
+    toplevel_manager: Mutex<Option<zcosmic_toplevel_manager_v1::ZcosmicToplevelManagerV1>>,
 }
 
 struct AppData {
@@ -95,9 +109,14 @@ struct AppData {
     registry_state: RegistryState,
     output_state: OutputState,
     shm_state: Shm,
+    seat_state: SeatState,
     screencopy_state: ScreencopyState,
     workspace_state: WorkspaceState,
     toplevel_info_state: ToplevelInfoState,
+    /// Optional because cosmic-comp may not advertise the unstable
+    /// management protocol on every build — we still want to start
+    /// without it and just no-op `activate_toplevel` if it's missing.
+    toplevel_manager_state: Option<ToplevelManagerState>,
 }
 
 impl AppData {
@@ -250,16 +269,35 @@ impl WaylandHelper {
                 toplevels: Mutex::new(Vec::new()),
                 info_done: AtomicBool::new(false),
                 info_done_notify: Notify::new(),
+                seats: Mutex::new(Vec::new()),
+                toplevel_manager: Mutex::new(None),
             }),
         };
+
+        // SeatState seeds itself from the registry on construction; copy
+        // those initial seats into the helper so activate_toplevel works
+        // before any hotplug event fires.
+        let seat_state = SeatState::new(&globals, &qh);
+        *helper.inner.seats.lock().unwrap() = seat_state.seats().collect();
+        let toplevel_manager_state = ToplevelManagerState::try_new(&registry_state, &qh);
+        if let Some(s) = &toplevel_manager_state {
+            *helper.inner.toplevel_manager.lock().unwrap() = Some(s.manager.clone());
+        } else {
+            tracing::info!(
+                "compositor did not advertise zcosmic_toplevel_manager_v1 — \
+                 window picker will not raise the chosen toplevel"
+            );
+        }
 
         let mut data = AppData {
             helper: helper.clone(),
             output_state: OutputState::new(&globals, &qh),
             shm_state,
+            seat_state,
             screencopy_state,
             workspace_state: WorkspaceState::new(&registry_state, &qh),
             toplevel_info_state: ToplevelInfoState::new(&registry_state, &qh),
+            toplevel_manager_state,
             registry_state,
         };
 
@@ -327,6 +365,92 @@ impl WaylandHelper {
             .iter()
             .find(|t| t.identifier == id)
             .map(|t| t.foreign_toplevel.clone())
+    }
+
+    /// Ask the compositor to raise + focus the toplevel identified by
+    /// `identifier`. Used right after the user clicks a tile in the window
+    /// picker so the captured window comes to the foreground — otherwise a
+    /// minimized/background pick would screenshot a stale buffer and the
+    /// user would see no visible state change confirming their click.
+    ///
+    /// Best-effort: returns silently if the compositor doesn't expose
+    /// `zcosmic_toplevel_manager_v1` (vanilla Wayland), if no `wl_seat` is
+    /// available, or if the identifier no longer maps to a live toplevel.
+    /// The activate request flips focus state via `state` events on the
+    /// `zcosmic_toplevel_handle_v1`; we don't await those — by the time
+    /// the screencopy fires the compositor will already have started
+    /// painting the raised buffer.
+    pub fn activate_toplevel(&self, identifier: &str) {
+        let manager = self.inner.toplevel_manager.lock().unwrap().clone();
+        let Some(manager) = manager else {
+            tracing::debug!(identifier, "activate_toplevel: no manager available");
+            return;
+        };
+        let seat = self.inner.seats.lock().unwrap().first().cloned();
+        let Some(seat) = seat else {
+            tracing::warn!(identifier, "activate_toplevel: no wl_seat known yet");
+            return;
+        };
+        // cosmic-comp ties the management protocol to the cosmic toplevel
+        // handle (not the ext_foreign one we use for screencopy). We look
+        // up both: the cosmic handle drives activate, the foreign handle
+        // is what the rest of the codebase keys on.
+        let cosmic_handle = self
+            .inner
+            .toplevels
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.identifier == identifier)
+            .and_then(|t| t.cosmic_toplevel.clone());
+        let Some(handle) = cosmic_handle else {
+            tracing::warn!(
+                identifier,
+                "activate_toplevel: no cosmic_toplevel_handle for identifier \
+                 (compositor did not advertise zcosmic_toplevel_info_v1?)"
+            );
+            return;
+        };
+        manager.activate(&handle, &seat);
+        if let Err(e) = self.inner.conn.flush() {
+            tracing::warn!(error = %e, "flush after activate failed");
+        }
+    }
+
+    /// Return the toplevel's geometry on the named output, if known.
+    /// Coordinates are output-local logical pixels — `(x, y)` is the
+    /// upper-left of the toplevel relative to the upper-left of the
+    /// output. Returns `None` if the toplevel is unknown, isn't on
+    /// that output, or the compositor hasn't advertised the
+    /// `geometry` event yet (needs `zcosmic_toplevel_info_v1` v2).
+    pub fn toplevel_geometry_on_output(
+        &self,
+        identifier: &str,
+        output_name: &str,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let toplevels = self.inner.toplevels.lock().unwrap();
+        let info = toplevels.iter().find(|t| t.identifier == identifier)?;
+        let infos = self.inner.output_infos.lock().unwrap();
+        let output = infos
+            .iter()
+            .find(|(_, i)| i.name.as_deref() == Some(output_name))
+            .map(|(o, _)| o.clone())?;
+        let g = info.geometry.get(&output)?;
+        Some((g.x, g.y, g.width, g.height))
+    }
+
+    /// Return the wayland output name for the first output the given
+    /// toplevel currently sits on. Used by the GUI to place the
+    /// recording border overlay on the right display when the user
+    /// records a window. Returns `None` if the toplevel is unknown or
+    /// none of its outputs report a name yet.
+    pub fn output_name_for_toplevel(&self, identifier: &str) -> Option<String> {
+        let toplevels = self.inner.toplevels.lock().unwrap();
+        let info = toplevels.iter().find(|t| t.identifier == identifier)?;
+        let infos = self.inner.output_infos.lock().unwrap();
+        info.output
+            .iter()
+            .find_map(|o| infos.get(o).and_then(|i| i.name.clone()))
     }
 
     pub fn output_for_name(&self, name: &str) -> Option<wl_output::WlOutput> {
@@ -725,11 +849,65 @@ impl ScreencopyHandler for AppData {
     }
 }
 
+impl SeatHandler for AppData {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.helper.inner.seats.lock().unwrap().push(seat);
+    }
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        _: Capability,
+    ) {
+    }
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        _: Capability,
+    ) {
+    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.helper.inner.seats.lock().unwrap().retain(|s| s != &seat);
+    }
+}
+
+impl ToplevelManagerHandler for AppData {
+    fn toplevel_manager_state(&mut self) -> &mut ToplevelManagerState {
+        // Safe because we only get capability events when the global
+        // bound successfully; cosmic-client-toolkit only routes events
+        // here through the delegate macro which requires the global
+        // to exist. If we ever invoke this with the `None` branch, it
+        // means the protocol vanished mid-session — fail loud.
+        self.toplevel_manager_state
+            .as_mut()
+            .expect("toplevel_manager_state delegated without binding")
+    }
+    fn capabilities(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _capabilities: Vec<
+            wayland_client::WEnum<
+                zcosmic_toplevel_manager_v1::ZcosmicToplelevelManagementCapabilitiesV1,
+            >,
+        >,
+    ) {
+    }
+}
+
 smithay_client_toolkit::delegate_output!(AppData);
 smithay_client_toolkit::delegate_registry!(AppData);
+smithay_client_toolkit::delegate_seat!(AppData);
 smithay_client_toolkit::delegate_shm!(AppData);
 cosmic_client_toolkit::delegate_screencopy!(AppData);
 cosmic_client_toolkit::delegate_toplevel_info!(AppData);
+cosmic_client_toolkit::delegate_toplevel_manager!(AppData);
 cosmic_client_toolkit::delegate_workspace!(AppData);
 delegate_noop!(AppData: ignore wl_buffer::WlBuffer);
 delegate_noop!(AppData: ignore wl_shm_pool::WlShmPool);

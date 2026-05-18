@@ -22,8 +22,8 @@ use gstreamer::{Buffer, ClockTime, MessageView, Pipeline, State};
 use gstreamer_app::{AppSink, AppSrc};
 use gstreamer_video::VideoInfo;
 
-use crate::capture::pipewire_capture::{gst_format_name, Capture as PwCapture, Frame, StreamFormat};
-use crate::encode::video::{build_crop_str, CropRect};
+use crate::capture::pipewire_capture::{gst_format_name, Frame, StreamFormat};
+use crate::encode::video::{build_crop_str, CaptureHandle, CropRect};
 
 pub struct GifSession {
     pipeline: Pipeline,
@@ -31,14 +31,17 @@ pub struct GifSession {
     writer_thread: std::thread::JoinHandle<Result<()>>,
     collector: Arc<Mutex<Option<gifski::Collector>>>,
     frame_counter: Arc<AtomicUsize>,
-    /// Keeps the pipewire consumer thread alive for the recording's
-    /// duration; drop on session teardown closes it.
-    _pw_capture: PwCapture,
+    /// Keeps whichever frame source feeds this session alive for the
+    /// recording's duration; drop on session teardown closes it.
+    /// `CaptureHandle` is an erased Box so a single GifSession can be fed
+    /// from pipewire (display via portal), cosmic-screencopy on an output,
+    /// or cosmic-screencopy on a toplevel.
+    _capture: CaptureHandle,
 }
 
 impl GifSession {
     pub fn build(
-        pw_capture: PwCapture,
+        capture: CaptureHandle,
         format: StreamFormat,
         output: &Path,
         fps: u32,
@@ -79,15 +82,39 @@ impl GifSession {
         // element factory ("no element 'video'") because the parenthesised
         // typed value confused the comma-token scanner. Collapsing every
         // negotiation into one terminal caps filter sidesteps it.
+        //
+        // We compute the output width AND height in Rust so the terminal
+        // capsfilter pins both. Specifying width only and letting videoscale
+        // pick the height was producing stretched GIFs: with no
+        // `pixel-aspect-ratio=1/1` constraint, downstream negotiation could
+        // settle on a non-1:1 PAR and keep the source height alongside the
+        // shrunken width — gifski then reads the raw `width × height` grid
+        // and the PAR information is lost, so the saved GIF displays as the
+        // un-corrected pixel grid (stretched horizontally).
         let crop_str = build_crop_str(crop, Some((format.width, format.height)));
-        let mut filters = vec![
-            "format=RGBA".to_string(),
-            format!("framerate={fps}/1"),
-        ];
-        if max_width > 0 {
-            filters.push(format!("width={max_width}"));
-        }
-        let out_caps = format!("video/x-raw,{}", filters.join(","));
+        let (src_w, src_h) = match crop {
+            Some(c) => {
+                let cw = c.w.min(format.width.saturating_sub(c.x.max(0) as u32));
+                let ch = c.h.min(format.height.saturating_sub(c.y.max(0) as u32));
+                if cw == 0 || ch == 0 {
+                    (format.width, format.height)
+                } else {
+                    (cw, ch)
+                }
+            }
+            None => (format.width, format.height),
+        };
+        let (out_w, out_h) = if max_width > 0 && src_w > max_width {
+            let scale = max_width as f64 / src_w as f64;
+            let h = ((src_h as f64) * scale).round() as u32;
+            (max_width, h.max(1))
+        } else {
+            (src_w, src_h)
+        };
+        let out_caps = format!(
+            "video/x-raw,format=RGBA,framerate={fps}/1,\
+             width={out_w},height={out_h},pixel-aspect-ratio=1/1",
+        );
         let pipeline_str = format!(
             "appsrc name=src is-live=true format=time do-timestamp=true \
              ! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 leaky=downstream \
@@ -180,7 +207,7 @@ impl GifSession {
             writer_thread,
             collector,
             frame_counter,
-            _pw_capture: pw_capture,
+            _capture: capture,
         })
     }
 
@@ -245,31 +272,57 @@ impl GifSession {
         state_result.context("gif pipeline → Playing")?;
 
         let bus = self.pipeline.bus().context("pipeline bus")?;
-        let (err_tx, mut err_rx) = tokio::sync::mpsc::unbounded_channel::<anyhow::Error>();
+        let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<Result<()>>();
+        // Poll the bus on a short timeout so a `shutdown` flag set by the
+        // main task can wake the thread without needing to post a custom
+        // message on the bus. iter_timed(NONE) would otherwise block forever
+        // if no EOS/Error ever arrives (e.g. after set_state(Null), which
+        // doesn't synthesize an EOS), and the bus_thread.join() at the end
+        // would hang indefinitely.
+        let bus_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bus_shutdown_thread = bus_shutdown.clone();
         let bus_thread = std::thread::spawn(move || {
-            for msg in bus.iter_timed(gstreamer::ClockTime::NONE) {
-                if let MessageView::Error(e) = msg.view() {
-                    let _ = err_tx.send(anyhow::anyhow!(
-                        "{}: {}",
-                        e.error(),
-                        e.debug().unwrap_or_default()
-                    ));
+            let tick = gstreamer::ClockTime::from_mseconds(100);
+            loop {
+                if bus_shutdown_thread.load(Ordering::Relaxed) {
                     break;
                 }
-                if matches!(msg.view(), MessageView::Eos(_)) {
-                    break;
+                let Some(msg) = bus.timed_pop(Some(tick)) else {
+                    continue;
+                };
+                match msg.view() {
+                    MessageView::Error(e) => {
+                        let _ = msg_tx.send(Err(anyhow::anyhow!(
+                            "{}: {}",
+                            e.error(),
+                            e.debug().unwrap_or_default()
+                        )));
+                        break;
+                    }
+                    MessageView::Eos(_) => {
+                        let _ = msg_tx.send(Ok(()));
+                        break;
+                    }
+                    _ => {}
                 }
             }
         });
 
         // Stop on either the user-initiated stop signal or a fatal bus error.
         let run_result: Result<()> = tokio::select! {
-            err = err_rx.recv() => Err(err.unwrap_or_else(|| anyhow::anyhow!("bus channel closed"))),
+            msg = msg_rx.recv() => msg.unwrap_or(Ok(())),
             _ = stop => Ok(()),
         };
 
-        // Drive the pipeline to EOS via the appsrc, then drain the bus.
+        // Drive the pipeline to EOS via the appsrc, then wait briefly for
+        // the bus to drain so the appsink can flush queued samples into
+        // gifski before we yank the pipeline.
         let _ = self.appsrc.end_of_stream();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            msg_rx.recv(),
+        )
+        .await;
         // Bounded shutdown — Null transition can also block if downstream
         // muxer is mid-write; same blocking-thread trick.
         let pipeline_for_stop = self.pipeline.clone();
@@ -278,6 +331,7 @@ impl GifSession {
             tokio::task::spawn_blocking(move || pipeline_for_stop.set_state(State::Null)),
         )
         .await;
+        bus_shutdown.store(true, Ordering::Relaxed);
         let _ = bus_thread.join();
 
         // Closing the collector signals the writer thread to finalize.

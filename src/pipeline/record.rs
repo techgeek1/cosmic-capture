@@ -72,37 +72,75 @@ pub async fn record_with_crop(
     Ok(path)
 }
 
-/// Record a single toplevel by its stable `identifier`. Bypasses the
-/// screencast portal entirely — frames come from cosmic-screencopy
-/// driven by `toplevel_capture`, fed into the same VideoSession encoder
-/// pipeline as the screen-record path. Crop is unsupported (the
-/// toplevel's own bounds *are* the crop).
-pub async fn record_toplevel(
+/// Describes which cosmic-screencopy source feeds a GUI-initiated
+/// recording. The GUI always knows the exact monitor (or toplevel) it
+/// wants — going via the screencast portal would defer the choice to
+/// the portal's restore-token, which is what produced the wrong-display
+/// bug for region/screen recordings.
+#[derive(Debug, Clone)]
+pub enum ScreencopyTarget {
+    /// Capture a named output. `output_name` matches the wayland output
+    /// name (e.g. "DP-1"). When paired with a `CropRect`, the crop is
+    /// in output-local physical pixels.
+    Output { output_name: String },
+    /// Capture a single toplevel by its stable
+    /// `ext_foreign_toplevel_list_v1` identifier. Crop is unsupported —
+    /// the toplevel's own bounds *are* the crop.
+    Toplevel { identifier: String },
+}
+
+/// Record a single source via cosmic-screencopy, bypassing the
+/// screencast portal. Used by every GUI-initiated recording (region,
+/// display, and window) so the user's pick lands on the exact monitor
+/// or window they chose. The CLI path (`run`) stays on the portal so
+/// the user can pick a source with the portal's own UI.
+pub async fn record_via_screencopy(
     helper: WaylandHelper,
-    identifier: String,
+    target: ScreencopyTarget,
     args: RecordArgs,
+    crop: Option<CropRect>,
     stop_rx: oneshot::Receiver<()>,
 ) -> Result<PathBuf> {
     tracing::info!(
-        identifier = %identifier,
+        ?target,
         container = ?args.container,
         fps = args.fps,
         encoder = ?args.encoder,
-        "record_toplevel: starting"
+        ?crop,
+        "record_via_screencopy: starting"
     );
 
-    let (capture, fmt_rx, frame_rx) =
-        toplevel_capture::start(helper, identifier.clone(), args.cursor, args.fps)
-            .context("start toplevel_capture")?;
+    let (capture, fmt_rx, frame_rx, allow_crop) = match &target {
+        ScreencopyTarget::Output { output_name } => {
+            let (c, f, frx) = toplevel_capture::start_for_output(
+                helper,
+                output_name.clone(),
+                args.cursor,
+                args.fps,
+            )
+            .context("start screencopy for output")?;
+            (c, f, frx, true)
+        }
+        ScreencopyTarget::Toplevel { identifier } => {
+            let (c, f, frx) = toplevel_capture::start(
+                helper,
+                identifier.clone(),
+                args.cursor,
+                args.fps,
+            )
+            .context("start screencopy for toplevel")?;
+            (c, f, frx, false)
+        }
+    };
 
     // First frame seeds the StreamFormat. cosmic-comp typically responds
-    // in <50ms; 5s is the same generous deadline screencast::start uses
-    // for portal-side format negotiation.
+    // in <50ms; 5s matches the deadline screencast::start uses for
+    // portal-side format negotiation.
     let format = tokio::time::timeout(std::time::Duration::from_secs(5), fmt_rx)
         .await
-        .map_err(|_| anyhow::anyhow!("toplevel screencopy did not produce a frame within 5s"))?
-        .map_err(|_| anyhow::anyhow!("toplevel_capture dropped before first frame"))?;
-    tracing::info!(?format, "toplevel screencopy format ready");
+        .map_err(|_| anyhow::anyhow!("screencopy did not produce a frame within 5s"))?
+        .map_err(|_| anyhow::anyhow!("screencopy capture dropped before first frame"))?;
+    tracing::info!(?format, "screencopy format ready");
 
     let path = paths::resolve(
         args.common.file.clone(),
@@ -118,7 +156,7 @@ pub async fn record_toplevel(
         args.container,
         args.encoder,
         args.audio,
-        None,
+        if allow_crop { crop } else { None },
     )?;
 
     session.run(stop_rx, frame_rx).await?;

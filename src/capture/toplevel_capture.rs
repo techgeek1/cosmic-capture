@@ -1,8 +1,10 @@
-//! Continuous toplevel screencopy → frame stream.
+//! Continuous cosmic-screencopy → frame stream for both toplevels and
+//! outputs.
 //!
-//! Plugs into `VideoSession` the same way `pipewire_capture::start` does:
-//! returns a drop-to-stop handle, a oneshot that resolves once we know
-//! the frame format, and an mpsc carrying frames in arrival order.
+//! Plugs into `VideoSession` / `GifSession` the same way
+//! `pipewire_capture::start` does: returns a drop-to-stop handle, a
+//! oneshot that resolves once we know the frame format, and an mpsc
+//! carrying frames in arrival order.
 //!
 //! Implementation: a tokio task drives `WaylandHelper::capture_source_shm`
 //! in a loop, paced to roughly `fps`. Each call creates and tears down a
@@ -10,6 +12,12 @@
 //! and correct against the cosmic-screencopy state machine and lets us
 //! reuse all the format-negotiation + memfd plumbing already in
 //! `WaylandHelper`.
+//!
+//! Used for window recording AND for display/region recording: the
+//! xdg-desktop-portal `ScreenCast` path cannot be told which monitor to
+//! pick (the portal caches the user's prior pick in a restore token),
+//! which surfaces as "Region recording records the wrong display". Going
+//! direct to screencopy lets us name the exact output ourselves.
 //!
 //! The cosmic-toolkit protocol *does* allow one session many frames; a
 //! follow-up can hoist `create_session` / `capture_session.capture(..)`
@@ -22,6 +30,7 @@ use cosmic_client_toolkit::screencopy::CaptureSource;
 use libspa::param::video::VideoFormat as SpaVideoFormat;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use wayland_client::protocol::wl_output;
 
 use super::pipewire_capture::{Frame, StreamFormat};
 use super::wayland::WaylandHelper;
@@ -65,7 +74,45 @@ pub fn start(
     let handle = helper
         .toplevel_handle_for_identifier(&id)
         .ok_or_else(|| anyhow!("no toplevel with identifier {id:?}"))?;
+    Ok(start_inner(
+        helper,
+        CaptureSource::Toplevel(handle),
+        "toplevel",
+        overlay_cursor,
+        fps,
+    ))
+}
 
+/// Start a continuous capture against the named output (display). Same
+/// shape as `start` for toplevels. Used instead of the screencast portal
+/// so the caller can pin recording to a specific monitor — the portal's
+/// restore-token machinery silently substitutes whichever output the
+/// user picked the first time, which is the wrong-display bug.
+pub fn start_for_output(
+    helper: WaylandHelper,
+    output_name: String,
+    overlay_cursor: bool,
+    fps: u32,
+) -> Result<(Capture, oneshot::Receiver<StreamFormat>, mpsc::Receiver<Frame>)> {
+    let output: wl_output::WlOutput = helper
+        .output_for_name(&output_name)
+        .ok_or_else(|| anyhow!("no output named {output_name:?}"))?;
+    Ok(start_inner(
+        helper,
+        CaptureSource::Output(output),
+        "output",
+        overlay_cursor,
+        fps,
+    ))
+}
+
+fn start_inner(
+    helper: WaylandHelper,
+    source: CaptureSource,
+    label: &'static str,
+    overlay_cursor: bool,
+    fps: u32,
+) -> (Capture, oneshot::Receiver<StreamFormat>, mpsc::Receiver<Frame>) {
     let (fmt_tx, fmt_rx) = oneshot::channel::<StreamFormat>();
     let (frame_tx, frame_rx) = mpsc::channel::<Frame>(16);
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -75,7 +122,8 @@ pub fn start(
 
     let task = tokio::spawn(run_loop(
         helper,
-        handle,
+        source,
+        label,
         overlay_cursor,
         fps,
         frame_budget,
@@ -84,19 +132,20 @@ pub fn start(
         stop_rx,
     ));
 
-    Ok((
+    (
         Capture {
             stop_tx: Some(stop_tx),
             task: Some(task),
         },
         fmt_rx,
         frame_rx,
-    ))
+    )
 }
 
 async fn run_loop(
     helper: WaylandHelper,
-    handle: wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    source: CaptureSource,
+    label: &'static str,
     overlay_cursor: bool,
     fps: u32,
     frame_budget: std::time::Duration,
@@ -112,11 +161,11 @@ async fn run_loop(
         // Check stop signal between frames so the loop exits promptly
         // when the GUI drops the Capture handle.
         if matches!(stop_rx.try_recv(), Ok(()) | Err(oneshot::error::TryRecvError::Closed)) {
-            tracing::info!("toplevel_capture: stop signalled");
+            tracing::info!(label, "screencopy_capture: stop signalled");
             return;
         }
 
-        let source = CaptureSource::Toplevel(handle.clone());
+        let source = source.clone();
         let frame_start = Instant::now();
         let captured = match helper.capture_source_shm(source, overlay_cursor).await {
             Some(c) => c,

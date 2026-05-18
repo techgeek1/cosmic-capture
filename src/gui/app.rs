@@ -44,6 +44,7 @@ use crate::capture::wayland::{WaylandHelper, WindowCapture};
 use crate::cli::{CommonArgs, GifArgs, RecordArgs, VideoContainer, VideoEncoder};
 use crate::encode::video::CropRect;
 use crate::pipeline;
+use crate::pipeline::record::ScreencopyTarget;
 
 use super::widget::{
     DragSession, RectMode, RectangleSelection, SelectionEvent, SelectionRect,
@@ -274,6 +275,19 @@ pub struct Panel {
     /// handler force-shuts to avoid the user being trapped behind a hung
     /// gst pipeline.
     saving_started_at: Option<std::time::Instant>,
+    /// Output name the current recording is pinned to (for both Screen
+    /// and Window recordings). Used by the per-output recording border
+    /// overlays so only the actively-recorded display paints the red
+    /// border — without this, every output would paint the border for
+    /// Source::Screen / Source::Window recordings (the legacy region
+    /// path used `self.region` to disambiguate, which doesn't exist
+    /// outside of Region mode).
+    recording_target_output: Option<String>,
+    /// Identifier of the toplevel the current recording is capturing, if
+    /// we're in window-record mode. Kept separately from
+    /// `recording_target_output` so a future revision can swap the
+    /// fullscreen-on-the-monitor border for a window-shaped one.
+    recording_window_id: Option<String>,
     /// Set true when Esc fires during recording. gst can't abort mid-stream
     /// (the muxer would leave a corrupt file), so we still let it drain;
     /// the *Finished message handler reads this flag and deletes the
@@ -324,6 +338,14 @@ pub struct WindowEntry {
     /// per entry because Handle::from_rgba copies the pixel buffer once
     /// and we don't want to redo that every redraw.
     thumb: cosmic::iced::widget::image::Handle,
+    /// Full-resolution capture that produced `thumb`. Held so that when
+    /// the user clicks the tile in Screenshot mode, we save *this*
+    /// frame instead of firing a fresh capture — matching the
+    /// region/display screenshot path, which serializes the
+    /// already-frozen output capture rather than capturing again.
+    /// Without this, the saved screenshot is from a different (later)
+    /// moment than the thumbnail the user clicked on.
+    frozen: Arc<CapturedFrame>,
     /// Source window pixel width — used to size each picker tile
     /// proportionally (`Length::FillPortion`) so a 1920px-wide window
     /// gets a wider tile than a 480px utility palette. Same arithmetic
@@ -359,6 +381,20 @@ pub enum Msg {
     /// Periodic tick during recording, fired by an `iced::time::every`
     /// subscription so the elapsed-time label on the stop pill keeps moving.
     Tick,
+    /// Periodic refresh of the window picker thumbnails. Fired by a
+    /// subscription while the user is sitting on Record + Window
+    /// (Idle, pre-capture) so the tiles update as window contents
+    /// change. Toplevel screencopy is cheap enough on cosmic-comp to
+    /// drive this at low single-digit Hz without saturating the
+    /// compositor.
+    LiveThumbnailRefresh,
+    /// Result of one per-toplevel re-capture, used by the live
+    /// thumbnail refresh path. `None` for a failed capture (the tile
+    /// keeps its previous image). Updates the matching entry in place
+    /// rather than replacing the whole `windows[output]` vec, so the
+    /// iced wgpu cache only churns one texture per arrival rather
+    /// than the full picker every tick.
+    SingleThumbRefresh(String, String, Option<CapturedFrame>),
 
     ToggleClipboard,
 
@@ -444,6 +480,8 @@ impl Application for Panel {
             capture: CaptureState::default(),
             recording_started_at: None,
             saving_started_at: None,
+            recording_target_output: None,
+            recording_window_id: None,
             cancel_pending: false,
             hovered_toolbar: None,
             windows: HashMap::new(),
@@ -486,38 +524,38 @@ impl Application for Panel {
                     let mut tasks: Vec<Task<Msg>> = Vec::new();
                     match m {
                         Mode::Screenshot => {
-                            // Refresh frozen-output captures only — those
-                            // depend on the live screen at the moment the
-                            // user enters Screenshot. The window picker
-                            // (self.windows) is the same across modes
-                            // and persists; we don't re-fire those
-                            // captures on mode swaps, which is what made
-                            // every toggle pay the picker-capture cost.
-                            let with_cursor = self.rec_cursor;
-                            for (&key, info) in &self.outputs {
-                                if info.frozen_handle.is_some() {
-                                    continue;
-                                }
-                                let helper = self.helper.clone();
-                                let name = info.name.clone();
-                                tasks.push(Task::perform(
-                                    async move {
-                                        capture_output_via_helper(&helper, &name, with_cursor)
-                                            .await
-                                    },
-                                    move |r| cosmic::action::app(Msg::FrozenFrameReady(key, r)),
-                                ));
+                            // Force-refresh BOTH freeze backgrounds and
+                            // window thumbnails so the snapshot the user
+                            // sees (freeze + window tiles) is taken from
+                            // the same wall-clock instant. The earlier
+                            // logic skipped already-frozen outputs and
+                            // never touched the window picker on mode
+                            // swaps, which left the two views out of
+                            // sync — fine when the user just toggled
+                            // back and forth, but visibly wrong on a
+                            // fresh Screenshot entry after a recording
+                            // session.
+                            tasks.push(self.force_refresh_output_freezes());
+                            if matches!(self.source, Source::Window) {
+                                tasks.push(self.force_refresh_window_picker());
                             }
                         }
                         Mode::Record => {
                             // Drop frozen-output captures so the next
                             // Screenshot entry re-captures fresh state.
-                            // The window picker persists across mode
-                            // swaps — toplevels haven't changed because
-                            // we toggled a mode button.
                             for info in self.outputs.values_mut() {
                                 info.frozen = None;
                                 info.frozen_handle = None;
+                            }
+                            // Window thumbnails are also frozen
+                            // snapshots; in Record mode the user is
+                            // about to capture live action against
+                            // those windows, so showing the stale
+                            // toolbar-open snapshot is the wrong
+                            // affordance — refresh on each entry so the
+                            // tiles match the current window contents.
+                            if matches!(self.source, Source::Window) {
+                                tasks.push(self.force_refresh_window_picker());
                             }
                         }
                     }
@@ -530,9 +568,18 @@ impl Application for Panel {
                 if !self.locked() && self.source != s {
                     self.source = s;
                     self.persist("source", &s);
-                    // Refresh in both modes — the picker is shared.
                     if matches!(s, Source::Window) {
-                        return self.refresh_window_picker();
+                        // Force a fresh capture every time the user
+                        // enters Window source so the tiles match
+                        // "right now". For Screenshot mode also re-fire
+                        // the output freezes so the freeze background
+                        // behind the tiles is synchronized with them.
+                        let mut tasks: Vec<Task<Msg>> = Vec::new();
+                        tasks.push(self.force_refresh_window_picker());
+                        if matches!(self.mode, Mode::Screenshot) {
+                            tasks.push(self.force_refresh_output_freezes());
+                        }
+                        return Task::batch(tasks);
                     }
                 }
             }
@@ -591,11 +638,16 @@ impl Application for Panel {
                                 bg_source,
                             },
                         );
-                        // First time we have any geometry, validate the
-                        // persisted region — if the monitor it lived on is
-                        // gone, drop it so the user doesn't see a phantom
-                        // rect pointing into empty space.
-                        self.prune_stale_region();
+                        // Don't `prune_stale_region` here: outputs arrive
+                        // one at a time, and a persisted region for
+                        // monitor 2 would be wiped the moment monitor 1
+                        // shows up (its rect doesn't contain the region
+                        // center). The region simply doesn't render
+                        // until its owning monitor comes online; the
+                        // user can still see it once all outputs are
+                        // registered. If the monitor is truly gone, the
+                        // region just sits invisibly until the user
+                        // drags a new one.
                         // Open the toolbar. Freeze capture only fires in
                         // Screenshot mode — Record needs the live screen
                         // visible so the user can frame the action they're
@@ -705,15 +757,36 @@ impl Application for Panel {
                 self.persist("last_region", &Option::<SelectionRect>::None);
             }
 
+            Msg::LiveThumbnailRefresh => {
+                // Intentionally a no-op. Live thumbnails are deferred
+                // until we have a streaming-texture widget (see
+                // project_todo_streaming_window_thumbnails.md). Polling
+                // + Handle::from_rgba causes iced to churn the wgpu
+                // texture cache every tick — visible as a full-picker
+                // flash even with per-tile updates, because each new
+                // Handle is a fresh cache key and image::allocate's
+                // pinning doesn't help across IDs.
+            }
+            Msg::SingleThumbRefresh(_, _, _) => {
+                // Parked alongside LiveThumbnailRefresh — see above.
+            }
+
             Msg::Tick => {
                 // While Saving, watch for a hung pipeline (e.g. gst stuck
                 // on EOS after the pwsrc caps assertion) and force a
                 // shutdown after a generous grace period so the user isn't
                 // trapped behind a frozen "Saving…" UI. cancel_pending
                 // ensures any in-flight output file is deleted.
+                //
+                // 30s is the upper bound for a legitimate finalize: gifski
+                // on a multi-second recording at quality 75 can spend
+                // several seconds quantizing + writing frames after the
+                // collector closes; H.264 muxer faststart rewrites likewise
+                // can take a moment on long recordings. Smaller values
+                // killed real saves mid-finalize.
                 if matches!(self.capture, CaptureState::Saving) {
                     if let Some(started) = self.saving_started_at {
-                        if started.elapsed() > std::time::Duration::from_secs(5) {
+                        if started.elapsed() > std::time::Duration::from_secs(30) {
                             tracing::warn!(
                                 elapsed_ms = started.elapsed().as_millis() as u64,
                                 "Saving stalled — forcing shutdown"
@@ -859,16 +932,41 @@ impl Application for Panel {
                 if !matches!(self.capture, CaptureState::Idle) {
                     return Task::none();
                 }
+                // Raise + focus the picked toplevel before tearing down
+                // the picker. cosmic-screencopy is happy to capture a
+                // minimized/background window, but the user's clicked it
+                // because they want to interact with it (especially in
+                // Record mode — they need it in the foreground to demo).
+                // Best-effort: silently no-ops on compositors without the
+                // unstable management protocol.
+                self.helper.activate_toplevel(&identifier);
                 let cursor = self.rec_cursor;
                 let close_bars = self.close_toolbars();
                 match self.mode {
                     Mode::Screenshot => {
                         let destination = self.current_destination();
                         let notify_user = self.notify;
+                        // Reuse the cached thumbnail frame so the saved
+                        // PNG is from the same instant as the tile the
+                        // user clicked — same trick the Region/Display
+                        // path uses with `info.frozen`. If no entry is
+                        // cached (e.g. the picker is still loading)
+                        // fall back to a fresh capture_toplevel so the
+                        // click still does something useful.
+                        let cached_frame = self
+                            .windows
+                            .values()
+                            .flat_map(|v| v.iter())
+                            .find(|e| e.identifier == identifier)
+                            .map(|e| (*e.frozen).clone());
                         self.capture = CaptureState::Saving;
                         self.saving_started_at = Some(std::time::Instant::now());
-                        return Task::batch([
-                            close_bars,
+                        let task = if let Some(frame) = cached_frame {
+                            Task::perform(
+                                run_save_frame(frame, None, destination, notify_user),
+                                |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+                            )
+                        } else {
                             Task::perform(
                                 run_toplevel_screenshot(
                                     identifier,
@@ -877,8 +975,9 @@ impl Application for Panel {
                                     notify_user,
                                 ),
                                 |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
-                            ),
-                        ]);
+                            )
+                        };
+                        return Task::batch([close_bars, task]);
                     }
                     Mode::Record => {
                         let helper = self.helper.clone();
@@ -886,16 +985,30 @@ impl Application for Panel {
                         let swap = self.open_recording_overlays();
                         let (stop_tx, stop_rx) = oneshot::channel();
                         let recording_started = std::time::Instant::now();
+                        let target = ScreencopyTarget::Toplevel {
+                            identifier: identifier.clone(),
+                        };
+                        self.recording_window_id = Some(identifier.clone());
+                        self.recording_target_output =
+                            self.helper.output_name_for_toplevel(&identifier);
                         match self.record_format {
                             RecordFormat::Gif => {
-                                // TODO: gif toplevel path (task #5).
                                 let args = self.build_gif_args();
-                                let _ = args; // suppress unused until wired
-                                tracing::warn!(
-                                    "GIF recording of a toplevel is not wired yet — \
-                                     falling back to no-op"
-                                );
-                                return Task::none();
+                                self.capture = CaptureState::Recording {
+                                    stop_tx: Some(stop_tx),
+                                };
+                                self.recording_started_at = Some(recording_started);
+                                return Task::batch([
+                                    close_bars,
+                                    stop_pill,
+                                    swap,
+                                    Task::perform(
+                                        run_gif_screencopy(
+                                            helper, target, args, None, stop_rx,
+                                        ),
+                                        |r| cosmic::action::app(Msg::GifFinished(r)),
+                                    ),
+                                ]);
                             }
                             _ => {
                                 let args = self.build_record_args();
@@ -908,8 +1021,8 @@ impl Application for Panel {
                                     stop_pill,
                                     swap,
                                     Task::perform(
-                                        run_record_toplevel(
-                                            helper, identifier, args, stop_rx,
+                                        run_record_screencopy(
+                                            helper, target, args, None, stop_rx,
                                         ),
                                         |r| cosmic::action::app(Msg::RecordingFinished(r)),
                                     ),
@@ -996,22 +1109,70 @@ impl Application for Panel {
             return self.view_toolbar(info);
         }
         // Recording overlay — pointer-transparent surface that just paints
-        // the red border around the active capture region. The widget is in
-        // Recording mode so it ignores input; drag/dnd plumbing here is
-        // unused but the API requires it.
+        // the red border around the active capture region. Gated on the
+        // *active source* (not `self.region.is_some()`): the user might
+        // have a persisted region sitting in state while currently
+        // recording a whole display, and we don't want the rect overlay
+        // to take precedence over the fullscreen border in that case.
+        // Other outputs render empty so we don't suggest they're also
+        // being captured.
         if let Some(info) = self.outputs.values().find(|o| o.recording_id == Some(id)) {
-            let output_rect = output_rect_of(info);
-            let selection = self.region.unwrap_or_default();
-            return RectangleSelection::new(
-                output_rect,
-                selection,
-                RectMode::Recording,
-                SELECTION_DND_ID,
-                id,
-                None,
-                Msg::Selection,
-            )
-            .into();
+            let on_target = self.recording_target_output.as_deref()
+                == Some(info.name.as_str());
+            if matches!(self.source, Source::Region) && on_target {
+                if let Some(region) = self.region {
+                    let output_rect = output_rect_of(info);
+                    return RectangleSelection::new(
+                        output_rect,
+                        region,
+                        RectMode::Recording,
+                        SELECTION_DND_ID,
+                        id,
+                        None,
+                        Msg::Selection,
+                    )
+                    .into();
+                }
+            }
+            if matches!(self.source, Source::Window) && on_target {
+                // Window mode: draw the border *around the window* by
+                // feeding the toplevel's compositor-global rect into
+                // RectangleSelection (its Recording mode is exactly the
+                // "thin red rect, no handles" we want). Falls back to
+                // a fullscreen border if the compositor hasn't
+                // advertised toplevel geometry yet (zcosmic_toplevel_
+                // info_v1 v2+) — better an oversized border than
+                // none.
+                if let Some(window_id) = self.recording_window_id.as_deref() {
+                    if let Some((wx, wy, ww, wh)) = self
+                        .helper
+                        .toplevel_geometry_on_output(window_id, &info.name)
+                    {
+                        let output_rect = output_rect_of(info);
+                        let selection = SelectionRect {
+                            left: info.logical_pos.0 + wx,
+                            top: info.logical_pos.1 + wy,
+                            right: info.logical_pos.0 + wx + ww,
+                            bottom: info.logical_pos.1 + wy + wh,
+                        };
+                        return RectangleSelection::new(
+                            output_rect,
+                            selection,
+                            RectMode::Recording,
+                            SELECTION_DND_ID,
+                            id,
+                            None,
+                            Msg::Selection,
+                        )
+                        .into();
+                    }
+                }
+                return fullscreen_recording_border();
+            }
+            if matches!(self.source, Source::Screen) && on_target {
+                return fullscreen_recording_border();
+            }
+            return iced::widget::Space::new().into();
         }
         iced::widget::Space::new().into()
     }
@@ -1040,11 +1201,22 @@ impl Application for Panel {
         // Pointer enter/exit per toolbar surface. iced's `listen_with`
         // surfaces a window id alongside each event; we use that to track
         // which output's toolbar the pointer is on so Source::Screen can
-        // highlight only that display. `CursorMoved` fires at the cursor
-        // sample rate (60+ Hz × N outputs) and triggers a redraw every
-        // tick, so we only listen for the discrete enter/leave events.
+        // highlight only that display.
+        //
+        // We also forward `CursorMoved`: iced/wayland doesn't always emit
+        // `CursorEntered` when a freshly-created layer surface appears
+        // under an already-on-output pointer (the wl_pointer.enter is
+        // sent, but its delivery to iced is racy with our event subscription
+        // attaching). Without `CursorMoved` the highlight would stick on
+        // the HashMap-order fallback output until the user crossed a
+        // display boundary. `Msg::PointerOn` early-returns when the
+        // hovered id doesn't change, so the per-frame motion stream
+        // doesn't drive any real redraws.
         let pointer = event::listen_with(|e, _, id| match e {
-            iced::Event::Mouse(mouse::Event::CursorEntered) => Some(Msg::PointerOn(Some(id))),
+            iced::Event::Mouse(mouse::Event::CursorEntered)
+            | iced::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                Some(Msg::PointerOn(Some(id)))
+            }
             iced::Event::Mouse(mouse::Event::CursorLeft) => Some(Msg::PointerOn(None)),
             _ => None,
         });
@@ -1060,6 +1232,9 @@ impl Application for Panel {
         } else {
             Subscription::none()
         };
+        // Live thumbnail subscription removed — see
+        // project_todo_streaming_window_thumbnails.md. Polling +
+        // Handle::from_rgba flashes the whole picker every tick.
         Subscription::batch([outputs, keys, pointer, tick])
     }
 }
@@ -1100,14 +1275,39 @@ impl Panel {
     /// Loading…" the user saw on every toggle. Outputs that go away
     /// drop their entry through `Output::Removed`; new outputs trigger
     /// their own per-output capture from `Output::Created`.
-    fn refresh_window_picker(&mut self) -> Task<Msg> {
+    /// Re-capture window picker thumbnails for every known output,
+    /// bypassing the "skip outputs that already have entries"
+    /// optimization that `refresh_window_picker` uses. The cached
+    /// behavior is right for stray toggles, but for explicit mode/source
+    /// entries the cached thumbnails are stale by design — the user is
+    /// asking us to show them what each window looks like *now*, not
+    /// what it looked like when the toolbar first opened.
+    fn force_refresh_window_picker(&mut self) -> Task<Msg> {
         let with_cursor = self.rec_cursor;
         let mut tasks: Vec<Task<Msg>> = Vec::new();
         for info in self.outputs.values() {
-            if self.windows.contains_key(&info.name) {
-                continue;
-            }
             tasks.push(self.spawn_picker_capture(info.name.clone(), with_cursor));
+        }
+        Task::batch(tasks)
+    }
+
+    /// Re-capture freeze backgrounds for every output. Used together
+    /// with `force_refresh_window_picker` so the picker thumbnails and
+    /// the underlying freeze line up at the same wall-clock instant —
+    /// the user's complaint was that the window thumbnails were from a
+    /// different moment than the frozen background behind them.
+    fn force_refresh_output_freezes(&mut self) -> Task<Msg> {
+        let with_cursor = self.rec_cursor;
+        let mut tasks: Vec<Task<Msg>> = Vec::new();
+        for (&key, info) in self.outputs.iter() {
+            let helper = self.helper.clone();
+            let name = info.name.clone();
+            tasks.push(Task::perform(
+                async move {
+                    capture_output_via_helper(&helper, &name, with_cursor).await
+                },
+                move |r| cosmic::action::app(Msg::FrozenFrameReady(key, r)),
+            ));
         }
         Task::batch(tasks)
     }
@@ -1247,13 +1447,27 @@ impl Panel {
         // height covers a single 32px button row with 8/8 vertical padding.
         const PILL_W: u32 = 220;
         const PILL_H: u32 = 56;
+        // Pin to the recording display. The earlier "put it on a
+        // non-recording output" plan kept the pill out of the captured
+        // file, but landed it on an arbitrary HashMap-order display
+        // when more than one non-recording output existed — users had
+        // to hunt for the pill across monitors. Pinning to the
+        // recording display is predictable; the pill being in the
+        // saved file is the cost. Falls back to `IcedOutput::Active`
+        // if we don't yet have geometry for the recording target.
+        let output = self
+            .recording_target_output
+            .as_deref()
+            .and_then(|name| self.outputs.values().find(|o| o.name == name))
+            .map(|o| IcedOutput::Output(o.output.clone()))
+            .unwrap_or(IcedOutput::Active);
         get_layer_surface(SctkLayerSurfaceSettings {
             id,
             layer: Layer::Overlay,
             keyboard_interactivity: KeyboardInteractivity::OnDemand,
             input_zone: None,
             anchor: Anchor::BOTTOM,
-            output: IcedOutput::Active,
+            output,
             namespace: "cosmic-capture-stop-pill".to_string(),
             size: Some((Some(PILL_W), Some(PILL_H))),
             exclusive_zone: -1,
@@ -1287,31 +1501,7 @@ impl Panel {
         Task::batch(tasks)
     }
 
-    /// Drop a persisted region if its center doesn't fall inside any current
-    /// output (e.g. the monitor was unplugged between launches). Better to
-    /// start clean than show a rect floating in nothingness.
-    fn prune_stale_region(&mut self) {
-        let Some(region) = self.region else {
-            return;
-        };
-        let region = region.normalize();
-        let cx = (region.left + region.right) / 2;
-        let cy = (region.top + region.bottom) / 2;
-        let on_an_output = self.outputs.values().any(|o| {
-            let r_left = o.logical_pos.0;
-            let r_top = o.logical_pos.1;
-            let r_right = r_left + o.logical_size.0 as i32;
-            let r_bottom = r_top + o.logical_size.1 as i32;
-            cx >= r_left && cx < r_right && cy >= r_top && cy < r_bottom
-        });
-        if !on_an_output {
-            tracing::info!(?region, "saved region is off-screen; clearing");
-            self.region = None;
-            self.persist("last_region", &Option::<SelectionRect>::None);
-        }
-    }
-
-    /// Write a single field to cosmic-config. We bypass the derived
+/// Write a single field to cosmic-config. We bypass the derived
     /// `set_<field>` helpers from `CosmicConfigEntry` because their
     /// "if self.x != value, write" diff is meaningless when called on a
     /// transient snapshot: we already built the snapshot from the caller's
@@ -1326,6 +1516,191 @@ impl Panel {
         if let Err(e) = config.set(key, value) {
             tracing::warn!(key, error = %e, "cosmic-config write failed");
         }
+    }
+
+    /// Stitch frozen captures from every output that intersects `region`
+    /// into a single image cropped to the region's bounds. Returns
+    /// `None` if no output overlaps or none of them have frozen frames
+    /// available. Used to make region screenshots work when the region
+    /// straddles a monitor boundary (cosmic-screenshot supports this;
+    /// cosmic-screencopy only delivers per-output captures, so we have
+    /// to composite ourselves).
+    ///
+    /// Mixed-scale handling: pick the largest scale among overlapping
+    /// outputs as the target and upscale lower-scale outputs via
+    /// nearest-neighbor. Quality compromise vs. the work of a proper
+    /// resampler, but fine for screenshots that are typically saved at
+    /// 1:1 and viewed at the original size.
+    fn stitch_region_screenshot(&self) -> Option<CapturedFrame> {
+        let region = self.region?.normalize();
+        if region.width() <= 0 || region.height() <= 0 {
+            return None;
+        }
+        let parts: Vec<(&OutputInfo, &Arc<CapturedFrame>)> = self
+            .outputs
+            .values()
+            .filter_map(|info| {
+                let r_left = info.logical_pos.0;
+                let r_top = info.logical_pos.1;
+                let r_right = r_left + info.logical_size.0 as i32;
+                let r_bottom = r_top + info.logical_size.1 as i32;
+                let overlaps = region.left < r_right
+                    && region.right > r_left
+                    && region.top < r_bottom
+                    && region.bottom > r_top;
+                if !overlaps {
+                    return None;
+                }
+                let frame = info.frozen.as_ref()?;
+                Some((info, frame))
+            })
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        let target_scale = parts
+            .iter()
+            .map(|(o, _)| o.scale.max(1) as u32)
+            .max()
+            .unwrap_or(1);
+        let canvas_w = (region.width() as u32).saturating_mul(target_scale);
+        let canvas_h = (region.height() as u32).saturating_mul(target_scale);
+        if canvas_w == 0 || canvas_h == 0 {
+            return None;
+        }
+        let canvas_stride = canvas_w.saturating_mul(4);
+        let mut canvas = vec![0u8; (canvas_stride as usize) * (canvas_h as usize)];
+        for (info, frame) in parts {
+            let out_left = info.logical_pos.0;
+            let out_top = info.logical_pos.1;
+            let out_right = out_left + info.logical_size.0 as i32;
+            let out_bottom = out_top + info.logical_size.1 as i32;
+            let ix_l = region.left.max(out_left);
+            let iy_t = region.top.max(out_top);
+            let ix_r = region.right.min(out_right);
+            let iy_b = region.bottom.min(out_bottom);
+            if ix_r <= ix_l || iy_b <= iy_t {
+                continue;
+            }
+            let src_scale = info.scale.max(1) as u32;
+            let src_x = ((ix_l - out_left).max(0) as u32).saturating_mul(src_scale);
+            let src_y = ((iy_t - out_top).max(0) as u32).saturating_mul(src_scale);
+            let src_w = ((ix_r - ix_l) as u32).saturating_mul(src_scale);
+            let src_h = ((iy_b - iy_t) as u32).saturating_mul(src_scale);
+            let dst_x = ((ix_l - region.left) as u32).saturating_mul(target_scale);
+            let dst_y = ((iy_t - region.top) as u32).saturating_mul(target_scale);
+            let dst_w = ((ix_r - ix_l) as u32).saturating_mul(target_scale);
+            let dst_h = ((iy_b - iy_t) as u32).saturating_mul(target_scale);
+            if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
+                continue;
+            }
+            for y in 0..dst_h {
+                let sy = src_y + ((y as u64 * src_h as u64) / dst_h as u64) as u32;
+                let src_row_off = (sy as usize) * (frame.stride as usize);
+                let dst_row_off = ((dst_y + y) as usize) * (canvas_stride as usize)
+                    + (dst_x as usize) * 4;
+                for x in 0..dst_w {
+                    let sx = src_x + ((x as u64 * src_w as u64) / dst_w as u64) as u32;
+                    let src_off = src_row_off + (sx as usize) * 4;
+                    let dst_off = dst_row_off + (x as usize) * 4;
+                    if src_off + 4 <= frame.pixels.len()
+                        && dst_off + 4 <= canvas.len()
+                    {
+                        canvas[dst_off..dst_off + 4]
+                            .copy_from_slice(&frame.pixels[src_off..src_off + 4]);
+                    }
+                }
+            }
+        }
+        Some(CapturedFrame {
+            pixels: canvas,
+            width: canvas_w,
+            height: canvas_h,
+            stride: canvas_stride,
+        })
+    }
+
+    /// Count how many known outputs the current region overlaps.
+    /// `0` means no region or off-screen; `1` is the fast single-output
+    /// path; `>1` means we need to stitch.
+    fn region_output_count(&self) -> usize {
+        let Some(region) = self.region else {
+            return 0;
+        };
+        let region = region.normalize();
+        if region.width() <= 0 || region.height() <= 0 {
+            return 0;
+        }
+        self.outputs
+            .values()
+            .filter(|o| {
+                let r_left = o.logical_pos.0;
+                let r_top = o.logical_pos.1;
+                let r_right = r_left + o.logical_size.0 as i32;
+                let r_bottom = r_top + o.logical_size.1 as i32;
+                region.left < r_right
+                    && region.right > r_left
+                    && region.top < r_bottom
+                    && region.bottom > r_top
+            })
+            .count()
+    }
+
+    /// Resolve the current `self.region` to the output it sits on plus
+    /// the crop rect expressed in that output's physical pixels. Used by
+    /// the screencopy-based Record path so we can pin recording to a
+    /// specific monitor rather than going through the screencast portal
+    /// (which silently substitutes whichever output the user picked
+    /// first via its restore-token).
+    fn region_output_and_crop(&self) -> Option<(String, CropRect)> {
+        let region = self.region?.normalize();
+        let cx = (region.left + region.right) / 2;
+        let cy = (region.top + region.bottom) / 2;
+        let info = self.outputs.values().find(|o| {
+            let r_left = o.logical_pos.0;
+            let r_top = o.logical_pos.1;
+            let r_right = r_left + o.logical_size.0 as i32;
+            let r_bottom = r_top + o.logical_size.1 as i32;
+            cx >= r_left && cx < r_right && cy >= r_top && cy < r_bottom
+        })?;
+        let scale = info.scale.max(1);
+        let lx = (region.left - info.logical_pos.0).max(0);
+        let ly = (region.top - info.logical_pos.1).max(0);
+        let lw = region.width().min(info.logical_size.0 as i32 - lx).max(1);
+        let lh = region.height().min(info.logical_size.1 as i32 - ly).max(1);
+        Some((
+            info.name.clone(),
+            CropRect {
+                x: lx * scale,
+                y: ly * scale,
+                w: (lw * scale) as u32,
+                h: (lh * scale) as u32,
+            },
+        ))
+    }
+
+    /// Compute the crop that excludes the on-screen recording border
+    /// from a Display recording on `output_name`. Returns `None` if we
+    /// don't have geometry for the output yet, or if the inset would
+    /// collapse the recording to zero pixels. Toplevel (window)
+    /// recordings don't need this — the border layer surface isn't
+    /// part of the toplevel's surface tree, so cosmic-screencopy
+    /// doesn't include it when capturing a Toplevel.
+    fn screen_border_crop(&self, output_name: &str) -> Option<CropRect> {
+        let info = self.outputs.values().find(|o| o.name == output_name)?;
+        let scale = info.scale.max(1) as u32;
+        let phys_w = info.logical_size.0.saturating_mul(scale);
+        let phys_h = info.logical_size.1.saturating_mul(scale);
+        let inset = SCREEN_CAPTURE_BORDER_INSET;
+        if phys_w <= inset * 2 || phys_h <= inset * 2 {
+            return None;
+        }
+        Some(CropRect {
+            x: inset as i32,
+            y: inset as i32,
+            w: phys_w - inset * 2,
+            h: phys_h - inset * 2,
+        })
     }
 
     fn crop_from_region(&self) -> Option<CropRect> {
@@ -1403,6 +1778,30 @@ impl Panel {
                     if matches!(self.source, Source::Window) {
                         return Task::none();
                     }
+                    // Cross-screen region screenshot: when the region spans
+                    // more than one output we can't get the whole image
+                    // from any single output's frozen capture. Stitch
+                    // every overlapping output's frozen frame into one
+                    // canvas sized to the region, then save that.
+                    // single-output regions and Screen/Window keep the
+                    // existing single-output path (faster, zero-copy
+                    // via the encoder's crop).
+                    if matches!(self.source, Source::Region)
+                        && self.region_output_count() >= 2
+                    {
+                        let Some(frame) = self.stitch_region_screenshot() else {
+                            tracing::warn!(
+                                "cross-screen region screenshot: no overlapping \
+                                 frozen frames available yet"
+                            );
+                            return Task::none();
+                        };
+                        self.capture = CaptureState::Saving;
+                        return Task::perform(
+                            run_save_frame(frame, None, destination, notify_user),
+                            |r| cosmic::action::app(Msg::ScreenshotFinished(r)),
+                        );
+                    }
                     let Some(output_name) = self.active_output_name(clicked_output.as_deref())
                     else {
                         tracing::warn!("no output detected; can't screenshot");
@@ -1441,9 +1840,48 @@ impl Panel {
                     if !self.can_start() {
                         return Task::none();
                     }
-                    let crop = match self.source {
-                        Source::Region => self.crop_from_region(),
-                        Source::Screen | Source::Window => None,
+                    // Pick the target monitor + optional crop. For Region,
+                    // crop_from_region already lands on the output whose
+                    // logical rect contains the region's center and returns
+                    // the crop in *that* output's physical-pixel space — so
+                    // we just need to look up its name here. For Screen, use
+                    // the same active_output_name selector that the
+                    // screenshot path uses.
+                    let (target, crop) = match self.source {
+                        Source::Region => {
+                            let Some((name, crop)) = self.region_output_and_crop() else {
+                                tracing::warn!(
+                                    "Region selected but no output contains it; \
+                                     aborting record start"
+                                );
+                                return Task::none();
+                            };
+                            self.recording_target_output = Some(name.clone());
+                            (ScreencopyTarget::Output { output_name: name }, Some(crop))
+                        }
+                        Source::Screen => {
+                            let Some(name) = self.active_output_name(clicked_output.as_deref())
+                            else {
+                                tracing::warn!("no output detected; can't record");
+                                return Task::none();
+                            };
+                            self.recording_target_output = Some(name.clone());
+                            // Crop SCREEN_CAPTURE_BORDER_INSET pixels off
+                            // each edge so the red recording border
+                            // (drawn flush against the output edge) is
+                            // excluded from the saved file. Output
+                            // screencopy captures everything composited
+                            // to the output, including our layer-shell
+                            // overlay, so the only way to keep the
+                            // border out of the recording is to record a
+                            // slightly smaller area than the full
+                            // output.
+                            let crop = self.screen_border_crop(&name);
+                            (ScreencopyTarget::Output { output_name: name }, crop)
+                        }
+                        // can_start() rules out Source::Window here — the
+                        // window picker drives CaptureToplevel directly.
+                        Source::Window => return Task::none(),
                     };
                     // Recording switchover: tear down the per-output
                     // toolbars (their hover-state redraws were flickering)
@@ -1453,6 +1891,7 @@ impl Panel {
                     let stop_pill = self.open_stop_pill();
                     let swap = self.open_recording_overlays();
                     let release_kb = Task::none();
+                    let helper = self.helper.clone();
                     match self.record_format {
                         RecordFormat::Gif => {
                             let args = self.build_gif_args();
@@ -1466,9 +1905,10 @@ impl Panel {
                                 stop_pill,
                                 swap,
                                 release_kb,
-                                Task::perform(run_gif(args, crop, stop_rx), |r| {
-                                    cosmic::action::app(Msg::GifFinished(r))
-                                }),
+                                Task::perform(
+                                    run_gif_screencopy(helper, target, args, crop, stop_rx),
+                                    |r| cosmic::action::app(Msg::GifFinished(r)),
+                                ),
                             ])
                         }
                         _ => {
@@ -1483,9 +1923,10 @@ impl Panel {
                                 stop_pill,
                                 swap,
                                 release_kb,
-                                Task::perform(run_record(args, crop, stop_rx), |r| {
-                                    cosmic::action::app(Msg::RecordingFinished(r))
-                                }),
+                                Task::perform(
+                                    run_record_screencopy(helper, target, args, crop, stop_rx),
+                                    |r| cosmic::action::app(Msg::RecordingFinished(r)),
+                                ),
                             ])
                         }
                     }
@@ -1652,9 +2093,20 @@ impl Panel {
         let label = format_elapsed(elapsed);
         let timer = cosmic::widget::text::body(label);
 
-        let row = row::with_capacity(3)
+        // Mirror the main toolbar pill's separator exactly — same 2px
+        // rule, same LightDivider class, same 56px height — so the
+        // stop pill reads as a member of the same UI family rather
+        // than a one-off chip.
+        let sep = || {
+            iced::widget::rule::vertical(2)
+                .class(cosmic::theme::Rule::LightDivider)
+                .height(Length::Fixed(56.0))
+        };
+        let row = row::with_capacity(5)
             .push(stop)
+            .push(sep())
             .push(timer)
+            .push(sep())
             .push(cancel)
             .spacing(10)
             .align_y(iced::Alignment::Center);
@@ -1861,26 +2313,34 @@ impl Panel {
         let output_rect = output_rect_of(info);
         let mut stack = iced::widget::Stack::new();
 
-        // Background painter. Source-keyed, mode-independent — Screenshot
-        // and Record render identically. Only `Source::Window` pushes a
-        // bg (the output wallpaper, so the picker tiles aren't drawn on
-        // top of copies of themselves); Region and Screen leave the
-        // surface transparent, letting the live desktop show through.
+        // Background painter. Mode-aware: Screenshot freezes the display
+        // (the surface paints the frozen output capture, so the user sees
+        // a stable image while framing the shot); Record leaves the
+        // surface transparent so the user can frame action that's
+        // happening live underneath. Source::Window is special in both
+        // modes — it paints the wallpaper so the picker tiles aren't
+        // drawn on top of copies of themselves.
         //
-        // We DO NOT push the frozen output capture as a bg in Screenshot
-        // mode, even though it's tempting visually: that texture (full
-        // output, 4K ≈ 33 MB) being in the Region tree but not in the
-        // Window tree creates an eviction antagonist for iced's wgpu
-        // cache. Every Region↔Window toggle inserts something new which
-        // makes `Cache::trim` fire and evict the texture(s) not present
-        // this frame, so each toggle pays a multi-texture reupload.
-        // Record mode never had this antagonist and toggles cleanly;
-        // dropping the frozen bg from the view makes Screenshot match.
-        //
-        // `info.frozen` and `info.frozen_handle` are still captured at
-        // toolbar open and still feed `pipeline::screenshot::save_frame`
-        // when the user clicks Capture, so the saved screenshot matches
-        // the moment the toolbar opened.
+        // Earlier this code skipped the frozen bg entirely to avoid an
+        // iced wgpu-cache eviction antagonist on Region↔Window toggles
+        // (the frozen 4K texture was in the Region tree but not the
+        // Window tree, so each toggle paid a multi-texture reupload).
+        // The fix here is to make the frozen bg unconditional in
+        // Screenshot mode — present in every Source's tree — so it's
+        // never the texture that gets evicted on a toggle.
+        if pre_capture
+            && matches!(self.mode, Mode::Screenshot)
+            && !matches!(self.source, Source::Window)
+        {
+            if let Some(handle) = info.frozen_handle.as_ref() {
+                stack = stack.push(
+                    cosmic::iced::widget::image(handle.clone())
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(cosmic::iced::ContentFit::Fill),
+                );
+            }
+        }
         if pre_capture && matches!(self.source, Source::Window) {
             if let Some(bg) = self.window_picker_bg(info) {
                 stack = stack.push(bg);
@@ -2041,30 +2501,74 @@ fn output_rect_of(info: &OutputInfo) -> SelectionRect {
 /// is active to signal which display will be captured. Pointer-transparent
 /// (it's just a styled container) so the user can still interact with the
 /// toolbar pill that sits above it in the Stack.
+/// Pre-recording hover affordance — "you'll capture this monitor"
+/// border drawn on the display the pointer is over. Uses the cosmic
+/// accent so it reads as a *selection hint* rather than active
+/// recording state.
 fn fullscreen_border<'a>() -> Element<'a, Msg> {
+    fullscreen_border_inner(BorderTint::Accent)
+}
+
+/// Active-recording variant — same shape but red. Drawn on the
+/// recording-target output by the recording overlay surfaces during
+/// Display + Window recording (Region uses the rectangle widget).
+fn fullscreen_recording_border<'a>() -> Element<'a, Msg> {
+    fullscreen_border_inner(BorderTint::Red)
+}
+
+#[derive(Copy, Clone)]
+enum BorderTint {
+    Accent,
+    Red,
+}
+
+fn fullscreen_border_inner<'a>(tint: BorderTint) -> Element<'a, Msg> {
     let border_only = container(iced::widget::Space::new())
         .width(Length::Fill)
         .height(Length::Fill)
-        .class(cosmic::theme::Container::Custom(Box::new(|theme| {
+        .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
             let t = theme.cosmic();
+            let color = match tint {
+                BorderTint::Accent => Color::from(t.accent_color()),
+                // Match RectangleSelection's RectMode::Recording red.
+                BorderTint::Red => Color::from_rgb(0.93, 0.20, 0.20),
+            };
             cosmic::iced::widget::container::Style {
                 background: None,
                 border: Border {
-                    radius: t.corner_radii.radius_m.into(),
+                    // Small 4px radius — same value RectangleSelection
+                    // uses for its recording border. Subtle enough that
+                    // the transparent corner gaps inside the capture
+                    // are essentially invisible (a few pixels at each
+                    // corner), but rounded enough that the on-screen
+                    // affordance doesn't look like a harsh frame.
+                    radius: 4.0.into(),
                     width: 3.0,
-                    color: t.accent_color().into(),
+                    color,
                 },
                 ..Default::default()
             }
         })));
-    // Outer container pads 8px on every side so the border sits visibly
-    // inset from the screen edge rather than clipping against it.
+    // No outer padding: the border sits flush against the output edge.
+    // The 8px inset we had earlier still showed up in the captured file
+    // because cosmic-screencopy captures *everything* composited on the
+    // output. Flushing the border to the edge means the 3px stroke can
+    // be cropped out by trimming 3px from each side of the recording
+    // (see `SCREEN_CAPTURE_BORDER_INSET`), which loses less of the
+    // actual content than the old 11px (8 padding + 3 stroke) inset
+    // would. The rounded corners do leave a few transparent pixels at
+    // each corner that fall inside the crop — acceptable: those are
+    // outside the rectangular recording region anyway.
     container(border_only)
-        .padding(8)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
+
+/// Pixel inset applied to display + window recordings so the visible
+/// red border (drawn at the output edge) is excluded from the saved
+/// file. Equals the border stroke width in [`fullscreen_border`].
+pub const SCREEN_CAPTURE_BORDER_INSET: u32 = 3;
 
 enum ActionKind {
     Normal,
@@ -2127,26 +2631,6 @@ fn record_button<'a>(
         .on_press_maybe(press)
 }
 
-async fn run_record(
-    args: RecordArgs,
-    crop: Option<CropRect>,
-    stop_rx: oneshot::Receiver<()>,
-) -> Result<String, String> {
-    pipeline::record::record_with_crop(args, crop, stop_rx)
-        .await
-        .map(path_to_string)
-        .map_err(|e| format!("{:#}", e))
-}
-async fn run_gif(
-    args: GifArgs,
-    crop: Option<CropRect>,
-    stop_rx: oneshot::Receiver<()>,
-) -> Result<String, String> {
-    pipeline::gif::gif_with_crop(args, crop, stop_rx)
-        .await
-        .map(path_to_string)
-        .map_err(|e| format!("{:#}", e))
-}
 async fn run_screenshot(
     output_name: String,
     cursor: bool,
@@ -2170,13 +2654,27 @@ async fn run_toplevel_screenshot(
         .map(path_to_string)
         .map_err(|e| format!("{:#}", e))
 }
-async fn run_record_toplevel(
+async fn run_record_screencopy(
     helper: WaylandHelper,
-    identifier: String,
+    target: ScreencopyTarget,
     args: RecordArgs,
+    crop: Option<CropRect>,
     stop_rx: oneshot::Receiver<()>,
 ) -> Result<String, String> {
-    pipeline::record::record_toplevel(helper, identifier, args, stop_rx)
+    pipeline::record::record_via_screencopy(helper, target, args, crop, stop_rx)
+        .await
+        .map(path_to_string)
+        .map_err(|e| format!("{:#}", e))
+}
+
+async fn run_gif_screencopy(
+    helper: WaylandHelper,
+    target: ScreencopyTarget,
+    args: GifArgs,
+    crop: Option<CropRect>,
+    stop_rx: oneshot::Receiver<()>,
+) -> Result<String, String> {
+    pipeline::gif::gif_via_screencopy(helper, target, args, crop, stop_rx)
         .await
         .map(path_to_string)
         .map_err(|e| format!("{:#}", e))
@@ -2243,6 +2741,7 @@ async fn capture_toplevels_for_output(
                 title: c.title,
                 app_id: c.app_id,
                 thumb,
+                frozen: Arc::new(c.frame),
                 width,
                 alloc: None,
             }

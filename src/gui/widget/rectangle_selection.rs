@@ -520,12 +520,35 @@ impl<'a, Msg: 'a + Clone> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         };
 
         if inner.width > 0.0 && inner.height > 0.0 {
-            let clipped = inner.intersection(&output_rect).unwrap_or(inner);
+            // In Recording mode, push the border BORDER_W pixels outside
+            // the region rect so the visible stroke lives entirely
+            // outside the captured area. iced renders the border inset
+            // (bounds.x..bounds.x+width occupies the stroke), so growing
+            // bounds outward by BORDER_W lands those pixels at
+            // (inner.x - BORDER_W .. inner.x), excluded by a crop that
+            // matches the region exactly. Selecting keeps the original
+            // inset shape — there's no recording, so no need to cheat
+            // for a crop.
+            let bounds = match self.mode {
+                Mode::Selecting => inner,
+                Mode::Recording => Rectangle {
+                    x: inner.x - BORDER_W,
+                    y: inner.y - BORDER_W,
+                    width: inner.width + BORDER_W * 2.0,
+                    height: inner.height + BORDER_W * 2.0,
+                },
+            };
+            let clipped = bounds.intersection(&output_rect).unwrap_or(bounds);
+            // Same subtle 4px corner radius for both modes — small
+            // enough that the transparent gaps at each corner of the
+            // recording frame are essentially invisible, large enough
+            // that the on-screen affordance reads as a softened rect.
+            let radius = 4.0;
             renderer.fill_quad(
                 Quad {
                     bounds: clipped,
                     border: Border {
-                        radius: 4.0.into(),
+                        radius: radius.into(),
                         width: BORDER_W,
                         color: border_color,
                     },

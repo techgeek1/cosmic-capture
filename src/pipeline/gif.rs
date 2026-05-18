@@ -1,12 +1,14 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 
-use crate::capture::{pipewire_capture, screencast};
+use crate::capture::wayland::WaylandHelper;
+use crate::capture::{pipewire_capture, screencast, toplevel_capture};
 use crate::cli::GifArgs;
 use crate::encode::gif::GifSession;
 use crate::encode::video::CropRect;
+use crate::pipeline::record::ScreencopyTarget;
 use crate::selector::{self, SelectionCancelled};
 use crate::{notify, paths};
 
@@ -30,13 +32,75 @@ pub async fn gif_with_crop(
 
     let path = paths::resolve(args.common.file.clone(), paths::Kind::Recording, "gif")?;
     let session = GifSession::build(
-        capture,
+        Box::new(capture),
         format,
         &path,
         args.fps,
         args.quality,
         args.max_width,
         crop,
+    )?;
+    session.run(stop_rx, frame_rx).await?;
+
+    if args.common.notify {
+        if let Err(e) = notify::saved(&path, "GIF").await {
+            tracing::warn!(error = %e, "failed to send notification");
+        }
+    }
+    Ok(path)
+}
+
+/// GIF counterpart to `record_via_screencopy`. Same routing rules: an
+/// `Output` target may carry a crop (in output-local physical pixels);
+/// a `Toplevel` target ignores any crop (the window's own bounds are
+/// the crop).
+pub async fn gif_via_screencopy(
+    helper: WaylandHelper,
+    target: ScreencopyTarget,
+    args: GifArgs,
+    crop: Option<CropRect>,
+    stop_rx: oneshot::Receiver<()>,
+) -> Result<PathBuf> {
+    tracing::info!(?target, fps = args.fps, ?crop, "gif_via_screencopy: starting");
+
+    let (capture, fmt_rx, frame_rx, allow_crop) = match &target {
+        ScreencopyTarget::Output { output_name } => {
+            let (c, f, frx) = toplevel_capture::start_for_output(
+                helper,
+                output_name.clone(),
+                args.cursor,
+                args.fps,
+            )
+            .context("start screencopy for output (gif)")?;
+            (c, f, frx, true)
+        }
+        ScreencopyTarget::Toplevel { identifier } => {
+            let (c, f, frx) = toplevel_capture::start(
+                helper,
+                identifier.clone(),
+                args.cursor,
+                args.fps,
+            )
+            .context("start screencopy for toplevel (gif)")?;
+            (c, f, frx, false)
+        }
+    };
+
+    let format = tokio::time::timeout(std::time::Duration::from_secs(5), fmt_rx)
+        .await
+        .map_err(|_| anyhow::anyhow!("screencopy did not produce a frame within 5s (gif)"))?
+        .map_err(|_| anyhow::anyhow!("screencopy capture dropped before first frame (gif)"))?;
+    tracing::info!(?format, "screencopy format ready (gif)");
+
+    let path = paths::resolve(args.common.file.clone(), paths::Kind::Recording, "gif")?;
+    let session = GifSession::build(
+        Box::new(capture),
+        format,
+        &path,
+        args.fps,
+        args.quality,
+        args.max_width,
+        if allow_crop { crop } else { None },
     )?;
     session.run(stop_rx, frame_rx).await?;
 
