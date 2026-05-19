@@ -83,7 +83,8 @@ impl VideoSession {
         fps: u32,
         container: VideoContainer,
         encoder: VideoEncoder,
-        audio: bool,
+        audio_mic: bool,
+        audio_system: bool,
         crop: Option<CropRect>,
     ) -> Result<Self> {
         gstreamer::init().context("gstreamer init")?;
@@ -140,11 +141,7 @@ impl VideoSession {
         };
 
         let location = escape_for_gst(output.to_string_lossy().as_ref());
-        let audio_branch = if audio {
-            "pulsesrc ! audioconvert ! audioresample ! avenc_aac ! mux.audio_0"
-        } else {
-            ""
-        };
+        let audio_branch = crate::encode::audio::audio_branch_str(audio_mic, audio_system);
         let gst_fmt = gst_format_name(format.format);
         // `appsrc name=src` is fed from `pump_frames` below. is-live=true
         // makes the source clock to wall-clock; format=time so we can stamp

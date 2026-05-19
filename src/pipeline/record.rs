@@ -61,7 +61,8 @@ pub async fn record_with_crop(
         args.fps,
         args.container,
         args.encoder,
-        args.audio,
+        args.mic,
+        args.system_audio,
         crop,
     )?;
 
@@ -168,7 +169,8 @@ pub async fn record_via_screencopy(
         &path,
         args.fps,
         args.container,
-        args.audio,
+        args.mic,
+        args.system_audio,
         if allow_crop { crop } else { None },
     )?;
 
@@ -272,7 +274,8 @@ pub async fn record_via_screencopy_multi(
         &path,
         args.fps,
         args.container,
-        args.audio,
+        args.mic,
+        args.system_audio,
     )?;
     session.run(stop_rx, frame_rxs).await?;
 

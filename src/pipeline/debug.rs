@@ -338,7 +338,8 @@ pub async fn run_dmabuf_record(args: DebugDmabufRecordArgs) -> Result<()> {
         &path,
         args.fps,
         VideoContainer::Mp4,
-        /* audio */ false,
+        /* audio_mic */ false,
+        /* audio_system */ false,
         None,
     )
     .context("VideoSessionDmabuf::build")?;
@@ -502,7 +503,8 @@ pub async fn run_dmabuf_record_multi(args: DebugDmabufRecordMultiArgs) -> Result
         &path,
         args.fps,
         VideoContainer::Mp4,
-        /* audio */ false,
+        /* audio_mic */ false,
+        /* audio_system */ false,
     )
     .context("VideoSessionDmabufMulti::build")?;
 

@@ -270,7 +270,8 @@ pub struct Panel {
     record_fps: RecordFps,
 
     rec_encoder: VideoEncoder,
-    rec_audio: bool,
+    rec_audio_mic: bool,
+    rec_audio_system: bool,
     rec_cursor: bool,
 
     notify: bool,
@@ -457,6 +458,8 @@ pub enum Msg {
     ThumbDirty,
 
     ToggleClipboard,
+    ToggleAudioMic,
+    ToggleAudioSystem,
 
     /// Trigger the main action (capture / start recording / stop recording).
     /// The optional output name carries the toolbar surface the click came
@@ -553,7 +556,8 @@ impl Application for Panel {
             record_format: settings.record_format,
             record_fps: settings.record_fps,
             rec_encoder: VideoEncoder::Auto,
-            rec_audio: false,
+            rec_audio_mic: false,
+            rec_audio_system: false,
             rec_cursor: true,
             notify: true,
             clipboard: false,
@@ -703,6 +707,8 @@ impl Application for Panel {
                 }
             }
             Msg::ToggleClipboard => self.clipboard = !self.clipboard,
+            Msg::ToggleAudioMic => self.rec_audio_mic = !self.rec_audio_mic,
+            Msg::ToggleAudioSystem => self.rec_audio_system = !self.rec_audio_system,
             Msg::SetSaveTarget(i) => {
                 if let Some(&t) = SAVE_TARGETS.get(i) {
                     if self.save_target != t {
@@ -2719,6 +2725,46 @@ impl Panel {
             Mode::Screenshot => None,
         };
 
+        // Audio cluster — record mode only, and never in GIF mode (the
+        // container can't carry an audio stream). Mic + system are two
+        // independent toggles; both default off. When "on" we swap class
+        // from IconVertical to Suggested so the toggle reads green/accent
+        // and stands out against the otherwise grey toolbar pill.
+        let audio_supported = matches!(self.mode, Mode::Record)
+            && !matches!(self.record_format, RecordFormat::Gif);
+        let audio_cluster: Option<Element<'_, Msg>> = if audio_supported {
+            let audio_button = |icon_name: &'static str, on: bool, msg: Msg| {
+                let class = if on {
+                    cosmic::theme::Button::Suggested
+                } else {
+                    cosmic::theme::Button::IconVertical
+                };
+                button::icon(icon::from_name(icon_name))
+                    .medium()
+                    .selected(on)
+                    .class(class)
+                    .on_press_maybe((!self.locked()).then_some(msg))
+            };
+            Some(
+                row::with_capacity(2)
+                    .push(audio_button(
+                        "audio-input-microphone-symbolic",
+                        self.rec_audio_mic,
+                        Msg::ToggleAudioMic,
+                    ))
+                    .push(audio_button(
+                        "audio-speakers-symbolic",
+                        self.rec_audio_system,
+                        Msg::ToggleAudioSystem,
+                    ))
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center)
+                    .into(),
+            )
+        } else {
+            None
+        };
+
         let close = button::icon(icon::from_name("window-close-symbolic"))
             .medium()
             .on_press(Msg::Quit);
@@ -2739,9 +2785,13 @@ impl Panel {
         if let Some(fps) = fps_dropdown {
             pill = pill.push(sep()).push(fps);
         }
-        let pill = pill
+        let mut pill = pill
             .push(sep())
-            .push(options)
+            .push(options);
+        if let Some(audio) = audio_cluster {
+            pill = pill.push(sep()).push(audio);
+        }
+        let pill = pill
             .push(sep())
             .push(close)
             .spacing(10)
@@ -2936,7 +2986,8 @@ impl Panel {
             fps: self.record_fps.as_u32(),
             encoder: self.rec_encoder,
             container,
-            audio: self.rec_audio,
+            mic: self.rec_audio_mic,
+            system_audio: self.rec_audio_system,
             cursor: self.rec_cursor,
             full: matches!(self.source, Source::Screen | Source::Window),
             duration_secs: None,

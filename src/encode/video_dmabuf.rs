@@ -93,7 +93,8 @@ impl VideoSessionDmabuf {
         output: &Path,
         fps: u32,
         container: VideoContainer,
-        audio: bool,
+        audio_mic: bool,
+        audio_system: bool,
         crop: Option<CropRect>,
     ) -> Result<Self> {
         gstreamer::init().context("gstreamer init")?;
@@ -112,14 +113,9 @@ impl VideoSessionDmabuf {
                 );
             }
         };
-        // Audio branch in parallel: pulsesrc → AAC → mux.audio_0.
-        // Matches VideoSession::build (the SHM/portal path) so the
-        // user's `--audio` choice has the same shape in both paths.
-        let audio_branch = if audio {
-            "pulsesrc ! audioconvert ! audioresample ! avenc_aac ! mux.audio_0"
-        } else {
-            ""
-        };
+        // Audio branch in parallel — see `encode::audio` for the shared
+        // mic/system/both fragment builder used by all video pipelines.
+        let audio_branch = crate::encode::audio::audio_branch_str(audio_mic, audio_system);
 
         // Normalize the requested crop rectangle: clip to source bounds
         // and round dimensions to even for H.264 4:2:0. `effective_crop`
@@ -182,12 +178,21 @@ impl VideoSessionDmabuf {
         // `GstVideoCropMeta` to know which sub-rect of the input to
         // process, then writes out at this size. Without a crop, let
         // negotiation pick the output size — the full source frame.
+        //
+        // `pixel-aspect-ratio=1/1` is critical: vapostproc otherwise
+        // preserves the *source* display aspect ratio across the
+        // dimension change, which it accomplishes by writing a non-1/1
+        // PAR into the stream metadata. That makes players stretch the
+        // cropped frame back toward the source DAR (e.g. a 796×482
+        // crop of a 2560×1440 / 16:9 source ends up displayed at ~857×482
+        // because the encoder stamps SAR=1928:1791 → DAR=16:9). Pinning
+        // PAR here forces square pixels end-to-end.
         let crop_filter = match effective_crop {
             Some(c) => format!(
-                "! video/x-raw(memory:VAMemory),format=NV12,width={},height={} !",
+                "! video/x-raw(memory:VAMemory),format=NV12,width={},height={},pixel-aspect-ratio=1/1 !",
                 c.w, c.h
             ),
-            None => "!".to_string(),
+            None => "! video/x-raw(memory:VAMemory),format=NV12,pixel-aspect-ratio=1/1 !".to_string(),
         };
 
         let location = escape_for_gst(output.to_string_lossy().as_ref());
@@ -551,7 +556,8 @@ impl VideoSessionDmabufMulti {
         output: &Path,
         fps: u32,
         container: VideoContainer,
-        audio: bool,
+        audio_mic: bool,
+        audio_system: bool,
     ) -> Result<Self> {
         gstreamer::init().context("gstreamer init")?;
         anyhow::ensure!(
@@ -627,22 +633,10 @@ impl VideoSessionDmabufMulti {
         let filesink = ElementFactory::make("filesink").build()?;
         filesink.set_property("location", output.to_string_lossy().to_string());
 
-        // Audio branch: pulsesrc → audioconvert → audioresample →
-        // avenc_aac → mux.audio_0. Built only when `audio=true`.
-        let audio_elements: Option<(
-            gstreamer::Element, // pulsesrc
-            gstreamer::Element, // audioconvert
-            gstreamer::Element, // audioresample
-            gstreamer::Element, // avenc_aac
-        )> = if audio {
-            let pulsesrc = ElementFactory::make("pulsesrc").build()?;
-            let aconv = ElementFactory::make("audioconvert").build()?;
-            let aresample = ElementFactory::make("audioresample").build()?;
-            let aenc = ElementFactory::make("avenc_aac").build()?;
-            Some((pulsesrc, aconv, aresample, aenc))
-        } else {
-            None
-        };
+        // Audio branch is added after the compositor tail is in the
+        // pipeline (so the muxer's audio_%u request pad exists). See
+        // `encode::audio::add_audio_branch` for the shared element-level
+        // builder mirroring `audio_branch_str`.
 
         // Composite output caps: fix to VAMemory NV12 at canvas size +
         // target framerate. vacompositor → vah264enc happily auto-
@@ -655,6 +649,11 @@ impl VideoSessionDmabufMulti {
             .field("width", canvas_w as i32)
             .field("height", canvas_h as i32)
             .field("framerate", gstreamer::Fraction::new(fps as i32, 1))
+            // Pin square pixels — see `crop_filter` in single-output
+            // build for the rationale. Without this, vacompositor /
+            // vah264enc stamp a non-1/1 SAR derived from the source
+            // outputs' geometry, which makes players stretch the result.
+            .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
             .build();
         let comp_capsfilter = ElementFactory::make("capsfilter")
             .property("caps", &comp_caps)
@@ -678,21 +677,9 @@ impl VideoSessionDmabufMulti {
         ])
         .context("link composite tail")?;
 
-        // Link the audio branch into `mux.audio_0` if it exists. Audio
-        // uses the mux's request `audio_%u` pad — different from video's
-        // static `sink` pad — so it links via `link_pads`.
-        if let Some((pulsesrc, aconv, aresample, aenc)) = audio_elements.as_ref() {
-            pipeline.add_many([pulsesrc, aconv, aresample, aenc])?;
-            gstreamer::Element::link_many([pulsesrc, aconv, aresample, aenc])
-                .context("link audio chain")?;
-            let aenc_src = aenc
-                .static_pad("src")
-                .ok_or_else(|| anyhow::anyhow!("avenc_aac has no src pad"))?;
-            let mux_audio = muxer
-                .request_pad_simple("audio_%u")
-                .ok_or_else(|| anyhow::anyhow!("muxer rejected audio_%u request pad"))?;
-            aenc_src.link(&mux_audio).context("link aenc → mux.audio_0")?;
-        }
+        // Link mic and/or system-monitor capture into a fresh `audio_%u`
+        // request pad on the muxer. Mixes when both bits are set.
+        crate::encode::audio::add_audio_branch(&pipeline, &muxer, audio_mic, audio_system)?;
 
         // vah264enc on this Mesa build emits delta frames with
         // PTS=GST_CLOCK_TIME_NONE while keeping a valid DTS. mp4mux
@@ -766,6 +753,8 @@ impl VideoSessionDmabufMulti {
                 .field("format", "NV12")
                 .field("width", part.src_crop.w as i32)
                 .field("height", part.src_crop.h as i32)
+                // Square pixels — see crop_filter in single-output build.
+                .field("pixel-aspect-ratio", gstreamer::Fraction::new(1, 1))
                 .build();
             let branch_capsfilter = ElementFactory::make("capsfilter")
                 .property("caps", &branch_caps)

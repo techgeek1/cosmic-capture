@@ -182,9 +182,13 @@ pub struct RecordArgs {
     #[arg(long, value_enum, default_value_t = VideoContainer::Mp4)]
     pub container: VideoContainer,
 
-    /// Capture system audio (default sink monitor).
+    /// Capture microphone (PulseAudio default source).
     #[arg(long, default_value_t = false)]
-    pub audio: bool,
+    pub mic: bool,
+
+    /// Capture system audio (PulseAudio @DEFAULT_MONITOR@).
+    #[arg(long, default_value_t = false)]
+    pub system_audio: bool,
 
     /// Include the cursor.
     #[arg(long, default_value_t = true,
