@@ -42,6 +42,12 @@ async fn run_cli(cmd: Command) -> Result<()> {
         Command::Screenshot(args) => pipeline::screenshot::run(args).await,
         Command::Record(args) => pipeline::record::run(args).await,
         Command::Gif(args) => pipeline::gif::run(args).await,
+        Command::DebugDmabuf(args) => pipeline::debug::run_dmabuf(args).await,
+        Command::DebugDmabufGst(args) => pipeline::debug::run_dmabuf_gst(args).await,
+        Command::DebugDmabufRecord(args) => pipeline::debug::run_dmabuf_record(args).await,
+        Command::DebugDmabufRecordMulti(args) => {
+            pipeline::debug::run_dmabuf_record_multi(args).await
+        }
         // Unreachable — already handled in main().
         Command::ClipboardServe(_) => unreachable!(),
     }

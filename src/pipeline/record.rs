@@ -3,12 +3,15 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 
+use crate::capture::dmabuf_stream;
 use crate::capture::pipewire_capture;
 use crate::capture::screencast;
-use crate::capture::toplevel_capture;
 use crate::capture::wayland::WaylandHelper;
 use crate::cli::RecordArgs;
 use crate::encode::video::{CropRect, VideoSession};
+use crate::encode::video_dmabuf::{
+    query_gst_consumer_formats, CompositePart, VideoSessionDmabuf, VideoSessionDmabufMulti,
+};
 use crate::selector::{self, SelectionCancelled};
 use crate::{notify, paths};
 
@@ -89,11 +92,16 @@ pub enum ScreencopyTarget {
     Toplevel { identifier: String },
 }
 
-/// Record a single source via cosmic-screencopy, bypassing the
-/// screencast portal. Used by every GUI-initiated recording (region,
-/// display, and window) so the user's pick lands on the exact monitor
-/// or window they chose. The CLI path (`run`) stays on the portal so
-/// the user can pick a source with the portal's own UI.
+/// Record a single source via cosmic-screencopy (dmabuf path), bypassing
+/// the screencast portal. Used by every GUI-initiated recording
+/// (region, display, and window) so the user's pick lands on the exact
+/// monitor or window they chose. Zero CPU touch on pixels:
+/// cosmic-screencopy writes into a GBM-allocated dmabuf, `vapostproc`
+/// imports it as a VA surface, `vah264enc` encodes the VA surface, the
+/// muxer writes the file.
+///
+/// The CLI path (`run`) stays on the portal so the user can pick a
+/// source with the portal's own UI.
 pub async fn record_via_screencopy(
     helper: WaylandHelper,
     target: ScreencopyTarget,
@@ -105,42 +113,48 @@ pub async fn record_via_screencopy(
         ?target,
         container = ?args.container,
         fps = args.fps,
-        encoder = ?args.encoder,
         ?crop,
-        "record_via_screencopy: starting"
+        "record_via_screencopy: starting (dmabuf)"
     );
+
+    // Negotiate (fourcc, modifier) with what vapostproc can import.
+    // Without this, cosmic-comp gives us the DCC-retile variant and
+    // vapostproc rejects negotiation.
+    let consumer = query_gst_consumer_formats("vapostproc")
+        .context("query vapostproc dmabuf formats")?;
 
     let (capture, fmt_rx, frame_rx, allow_crop) = match &target {
         ScreencopyTarget::Output { output_name } => {
-            let (c, f, frx) = toplevel_capture::start_for_output(
+            let (c, f, frx) = dmabuf_stream::start_dmabuf_for_output(
                 helper,
                 output_name.clone(),
                 args.cursor,
                 args.fps,
+                consumer,
             )
-            .context("start screencopy for output")?;
+            .context("start dmabuf screencopy for output")?;
             (c, f, frx, true)
         }
         ScreencopyTarget::Toplevel { identifier } => {
-            let (c, f, frx) = toplevel_capture::start(
+            let (c, f, frx) = dmabuf_stream::start_dmabuf_for_toplevel(
                 helper,
                 identifier.clone(),
                 args.cursor,
                 args.fps,
+                consumer,
             )
-            .context("start screencopy for toplevel")?;
+            .context("start dmabuf screencopy for toplevel")?;
             (c, f, frx, false)
         }
     };
 
-    // First frame seeds the StreamFormat. cosmic-comp typically responds
-    // in <50ms; 5s matches the deadline screencast::start uses for
-    // portal-side format negotiation.
+    // First frame seeds the negotiated format. cosmic-comp typically
+    // responds in <50ms; 5s matches the deadline screencast::start uses.
     let format = tokio::time::timeout(std::time::Duration::from_secs(5), fmt_rx)
         .await
         .map_err(|_| anyhow::anyhow!("screencopy did not produce a frame within 5s"))?
         .map_err(|_| anyhow::anyhow!("screencopy capture dropped before first frame"))?;
-    tracing::info!(?format, "screencopy format ready");
+    tracing::info!(?format, "dmabuf stream format ready");
 
     let path = paths::resolve(
         args.common.file.clone(),
@@ -148,18 +162,119 @@ pub async fn record_via_screencopy(
         args.container.extension(),
     )?;
 
-    let session = VideoSession::build(
+    let session = VideoSessionDmabuf::build(
         Box::new(capture),
         format,
         &path,
         args.fps,
         args.container,
-        args.encoder,
         args.audio,
         if allow_crop { crop } else { None },
     )?;
 
     session.run(stop_rx, frame_rx).await?;
+
+    if args.common.notify {
+        if let Err(e) = notify::saved(&path, "Recording").await {
+            tracing::warn!(error = %e, "failed to send notification");
+        }
+    }
+    Ok(path)
+}
+
+/// One overlapping output in a cross-screen region recording. The
+/// geometry math (output-local physical crop + canvas-coord placement)
+/// matches `gui::app::stitch_region_screenshot`'s overlap loop; both
+/// callers use `gui::app::compute_region_parts` to derive these values.
+#[derive(Clone, Debug)]
+pub struct RegionPart {
+    pub output_name: String,
+    /// Source crop in this output's physical pixels.
+    pub src_crop: CropRect,
+    /// Top-left of this output's contribution within the composite
+    /// canvas, in canvas pixels.
+    pub dst_pos: (u32, u32),
+    /// Size of this output's contribution within the composite canvas,
+    /// in canvas pixels. Caller scales by `target_scale` to align cross-
+    /// DPI displays.
+    pub dst_size: (u32, u32),
+}
+
+/// Record a region that spans multiple outputs. Each overlapping output
+/// is captured to its own dmabuf stream, cropped on the GPU via
+/// `vapostproc` + `GstVideoCropMeta`, and composited by `vacompositor`
+/// into a single VA surface before encoding.
+pub async fn record_via_screencopy_multi(
+    helper: WaylandHelper,
+    parts: Vec<RegionPart>,
+    args: RecordArgs,
+    stop_rx: oneshot::Receiver<()>,
+) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !parts.is_empty(),
+        "record_via_screencopy_multi called with no overlapping outputs"
+    );
+    tracing::info!(
+        container = ?args.container,
+        fps = args.fps,
+        part_count = parts.len(),
+        "record_via_screencopy_multi: starting"
+    );
+
+    let consumer = query_gst_consumer_formats("vapostproc")
+        .context("query vapostproc dmabuf formats")?;
+
+    // Start one dmabuf stream per overlapping output, then await each
+    // first-frame format negotiation. The streams pace themselves to
+    // `args.fps`; vacompositor handles per-pad timing alignment.
+    let mut captures: Vec<Box<dyn std::any::Any + Send>> = Vec::with_capacity(parts.len());
+    let mut frame_rxs = Vec::with_capacity(parts.len());
+    let mut composite_parts = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (capture, fmt_rx, frame_rx) = dmabuf_stream::start_dmabuf_for_output(
+            helper.clone(),
+            part.output_name.clone(),
+            args.cursor,
+            args.fps,
+            consumer.clone(),
+        )
+        .with_context(|| format!("start dmabuf stream for {}", part.output_name))?;
+        let format = tokio::time::timeout(std::time::Duration::from_secs(5), fmt_rx)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "stream {} did not negotiate format within 5s",
+                    part.output_name
+                )
+            })?
+            .map_err(|_| {
+                anyhow::anyhow!("stream {} dropped before first frame", part.output_name)
+            })?;
+        tracing::info!(name = %part.output_name, ?format, "branch format negotiated");
+        captures.push(Box::new(capture));
+        frame_rxs.push(frame_rx);
+        composite_parts.push(CompositePart {
+            src_crop: part.src_crop,
+            dst_pos: part.dst_pos,
+            dst_size: part.dst_size,
+            format,
+        });
+    }
+
+    let path = paths::resolve(
+        args.common.file.clone(),
+        paths::Kind::Recording,
+        args.container.extension(),
+    )?;
+    let session = VideoSessionDmabufMulti::build(
+        captures,
+        composite_parts,
+        &path,
+        args.fps,
+        args.container,
+        args.audio,
+    )?;
+    session.run(stop_rx, frame_rxs).await?;
 
     if args.common.notify {
         if let Err(e) = notify::saved(&path, "Recording").await {

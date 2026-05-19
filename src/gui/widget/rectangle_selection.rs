@@ -538,7 +538,16 @@ impl<'a, Msg: 'a + Clone> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                     height: inner.height + BORDER_W * 2.0,
                 },
             };
-            let clipped = bounds.intersection(&output_rect).unwrap_or(bounds);
+            // Leave bounds unclipped in both modes so the border stroke
+            // lands at the rect's *actual* edges even when the rect spans
+            // multiple outputs — `bounds.intersection(output_rect)` would
+            // introduce an artificial edge along the seam where the rect
+            // crosses an output boundary, and `fill_quad`'s border-stroke
+            // pass would paint a visible stripe (red in Recording mode,
+            // accent in Selecting mode) at that seam. Each surface's
+            // wgpu scissor clips the parts that overflow into other
+            // outputs naturally, so we don't need to do it here.
+            let drawn = bounds;
             // Same subtle 4px corner radius for both modes — small
             // enough that the transparent gaps at each corner of the
             // recording frame are essentially invisible, large enough
@@ -546,7 +555,7 @@ impl<'a, Msg: 'a + Clone> Widget<Msg, cosmic::Theme, cosmic::Renderer>
             let radius = 4.0;
             renderer.fill_quad(
                 Quad {
-                    bounds: clipped,
+                    bounds: drawn,
                     border: Border {
                         radius: radius.into(),
                         width: BORDER_W,

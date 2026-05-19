@@ -39,6 +39,14 @@ cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", re
 rustix = { version = "0.38", features = ["event", "fs"] }
 memmap2 = "0.9"
 
+# GBM + DRM fourcc constants. Used by the dmabuf-backed screencopy path:
+# we allocate a GPU buffer object through GBM, hand its fd to cosmic-comp
+# via linux-dmabuf-v1, and feed the same fd downstream to gst's vapostproc
+# for zero-copy recording. Mesa/Intel/AMD all expose libgbm; NVIDIA does
+# too on recent drivers.
+gbm = "0.18"
+drm-fourcc = "2.2"
+
 # PNG encode + Wayland clipboard for the screenshot output paths.
 png = "0.17"
 wl-clipboard-rs = "0.9"
@@ -60,7 +68,15 @@ libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = fa
 # gst_caps_is_fixed (pwsrc->caps) assertion on cosmic-comp's screencast.
 gstreamer = "0.23"
 gstreamer-app = "0.23"
-gstreamer-video = "0.23"
+# `v1_24` unlocks `VideoInfoDmaDrm` / `dma_drm_fourcc_from_format` etc. —
+# the canonical API for building `format=DMA_DRM, drm-format=…` caps
+# from a fourcc + modifier pair. Host gstreamer on the user's machine
+# is 1.28, well past the 1.24 minimum the feature gates.
+gstreamer-video = { version = "0.23", features = ["v1_24"] }
+# DmaBufAllocator: wraps an OwnedFd into a GstMemory tagged `memory:DMABuf`,
+# letting downstream `vapostproc`/`vacompositor` import the GPU buffer
+# zero-copy instead of falling back to a sysmem download.
+gstreamer-allocators = "0.23"
 
 # Direct PipeWire stream consumption. We connect to the node id the
 # screencast portal hands us as a consumer (Direction::Input), pump

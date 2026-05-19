@@ -420,6 +420,19 @@ pub struct WindowEntry {
     streaming: Option<Arc<SharedFrame>>,
 }
 
+/// Cross-screen region geometry shared by `stitch_region_screenshot`
+/// and the cross-screen recording path. `canvas_w`/`canvas_h` are the
+/// composite dimensions in physical pixels; `target_scale` is the
+/// max-of-overlap scale we picked; `parts` is the per-output input
+/// rectangles + their canvas placement.
+#[allow(dead_code)] // canvas_h + target_scale are surfaced for callers that may want them
+struct RegionLayout {
+    canvas_w: u32,
+    canvas_h: u32,
+    target_scale: u32,
+    parts: Vec<pipeline::record::RegionPart>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Msg {
     SetMode(Mode),
@@ -1343,19 +1356,38 @@ impl Application for Panel {
         if let Some(info) = self.outputs.values().find(|o| o.recording_id == Some(id)) {
             let on_target = self.recording_target_output.as_deref()
                 == Some(info.name.as_str());
-            if matches!(self.source, Source::Region) && on_target {
+            // Region recording: draw the rect outline on *every* output
+            // that overlaps the region, not just the target. For single-
+            // output regions this is the same set as before (one output);
+            // for cross-screen it lets each participating output draw its
+            // slice of the rect. `RectangleSelection` clips the outline to
+            // `output_rect`, so the rect's outer perimeter only renders
+            // where it sits inside each output — no red drawn at the
+            // seam between outputs (the seam runs through the rect's
+            // interior, not its perimeter).
+            if matches!(self.source, Source::Region) {
                 if let Some(region) = self.region {
                     let output_rect = output_rect_of(info);
-                    return RectangleSelection::new(
-                        output_rect,
-                        region,
-                        RectMode::Recording,
-                        SELECTION_DND_ID,
-                        id,
-                        None,
-                        Msg::Selection,
-                    )
-                    .into();
+                    let overlaps = region.normalize().left < output_rect.right
+                        && region.normalize().right > output_rect.left
+                        && region.normalize().top < output_rect.bottom
+                        && region.normalize().bottom > output_rect.top;
+                    if overlaps {
+                        return RectangleSelection::new(
+                            output_rect,
+                            region,
+                            RectMode::Recording,
+                            SELECTION_DND_ID,
+                            id,
+                            None,
+                            Msg::Selection,
+                        )
+                        .into();
+                    }
+                    // Non-overlapping output during a Region recording —
+                    // empty surface, no border. Fall through to the
+                    // bottom of this match.
+                    return iced::widget::Space::new().into();
                 }
             }
             if matches!(self.source, Source::Window) && on_target {
@@ -1837,35 +1869,113 @@ impl Panel {
     /// resampler, but fine for screenshots that are typically saved at
     /// 1:1 and viewed at the original size.
     fn stitch_region_screenshot(&self) -> Option<CapturedFrame> {
+        let layout = self.compute_region_parts()?;
+        let canvas_w = layout.canvas_w;
+        let canvas_h = layout.canvas_h;
+        let canvas_stride = canvas_w.saturating_mul(4);
+        let mut canvas = vec![0u8; (canvas_stride as usize) * (canvas_h as usize)];
+        let mut copied_parts = 0usize;
+        let mut copied_pixels = 0usize;
+        for part in &layout.parts {
+            let Some(frame) = self
+                .outputs
+                .values()
+                .find(|o| o.name == part.output_name)
+                .and_then(|o| o.frozen.as_ref())
+            else {
+                tracing::warn!(
+                    output = %part.output_name,
+                    "stitch_region_screenshot: no frozen frame for output, skipping"
+                );
+                continue;
+            };
+            let src_x = part.src_crop.x as u32;
+            let src_y = part.src_crop.y as u32;
+            let src_w = part.src_crop.w;
+            let src_h = part.src_crop.h;
+            let dst_x = part.dst_pos.0;
+            let dst_y = part.dst_pos.1;
+            let dst_w = part.dst_size.0;
+            let dst_h = part.dst_size.1;
+            if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
+                continue;
+            }
+            let before = copied_pixels;
+            for y in 0..dst_h {
+                let sy = src_y + ((y as u64 * src_h as u64) / dst_h as u64) as u32;
+                let src_row_off = (sy as usize) * (frame.stride as usize);
+                let dst_row_off =
+                    ((dst_y + y) as usize) * (canvas_stride as usize) + (dst_x as usize) * 4;
+                for x in 0..dst_w {
+                    let sx = src_x + ((x as u64 * src_w as u64) / dst_w as u64) as u32;
+                    let src_off = src_row_off + (sx as usize) * 4;
+                    let dst_off = dst_row_off + (x as usize) * 4;
+                    if src_off + 4 <= frame.pixels.len() && dst_off + 4 <= canvas.len() {
+                        canvas[dst_off..dst_off + 4]
+                            .copy_from_slice(&frame.pixels[src_off..src_off + 4]);
+                        copied_pixels += 1;
+                    }
+                }
+            }
+            if copied_pixels > before {
+                copied_parts += 1;
+            }
+        }
+        if copied_parts == 0 {
+            // All parts skipped (no frozen frames yet, or every per-pixel
+            // bounds check failed). Saving the all-zero canvas as a PNG
+            // would produce a blank/garbage image — better to fail
+            // upward and let the caller log + abort the save.
+            tracing::warn!(
+                parts = layout.parts.len(),
+                "stitch_region_screenshot: no parts copied, aborting"
+            );
+            return None;
+        }
+        Some(CapturedFrame {
+            pixels: canvas,
+            width: canvas_w,
+            height: canvas_h,
+            stride: canvas_stride,
+        })
+    }
+
+    /// Geometry of one region recording / screenshot. Each `RegionPart`
+    /// names an overlapping output, the rectangle within its physical
+    /// pixel grid that contributes to the canvas, and the target
+    /// position+size on the canvas. The canvas itself is
+    /// `region × target_scale` pixels, where `target_scale =
+    /// max(overlap.scale)` so mixed-DPI layouts produce a single uniform
+    /// canvas resolution.
+    ///
+    /// Shared between `stitch_region_screenshot` (CPU blit) and
+    /// `pipeline::record::record_via_screencopy_multi` (GPU composite)
+    /// so the two paths can't drift on geometry.
+    fn compute_region_parts(&self) -> Option<RegionLayout> {
         let region = self.region?.normalize();
         if region.width() <= 0 || region.height() <= 0 {
             return None;
         }
-        let parts: Vec<(&OutputInfo, &Arc<CapturedFrame>)> = self
+        let overlapping: Vec<&OutputInfo> = self
             .outputs
             .values()
-            .filter_map(|info| {
+            .filter(|info| {
                 let r_left = info.logical_pos.0;
                 let r_top = info.logical_pos.1;
                 let r_right = r_left + info.logical_size.0 as i32;
                 let r_bottom = r_top + info.logical_size.1 as i32;
-                let overlaps = region.left < r_right
+                region.left < r_right
                     && region.right > r_left
                     && region.top < r_bottom
-                    && region.bottom > r_top;
-                if !overlaps {
-                    return None;
-                }
-                let frame = info.frozen.as_ref()?;
-                Some((info, frame))
+                    && region.bottom > r_top
             })
             .collect();
-        if parts.is_empty() {
+        if overlapping.is_empty() {
             return None;
         }
-        let target_scale = parts
+        let target_scale = overlapping
             .iter()
-            .map(|(o, _)| o.scale.max(1) as u32)
+            .map(|o| o.scale.max(1) as u32)
             .max()
             .unwrap_or(1);
         let canvas_w = (region.width() as u32).saturating_mul(target_scale);
@@ -1873,9 +1983,8 @@ impl Panel {
         if canvas_w == 0 || canvas_h == 0 {
             return None;
         }
-        let canvas_stride = canvas_w.saturating_mul(4);
-        let mut canvas = vec![0u8; (canvas_stride as usize) * (canvas_h as usize)];
-        for (info, frame) in parts {
+        let mut parts: Vec<pipeline::record::RegionPart> = Vec::with_capacity(overlapping.len());
+        for info in overlapping {
             let out_left = info.logical_pos.0;
             let out_top = info.logical_pos.1;
             let out_right = out_left + info.logical_size.0 as i32;
@@ -1896,32 +2005,26 @@ impl Panel {
             let dst_y = ((iy_t - region.top) as u32).saturating_mul(target_scale);
             let dst_w = ((ix_r - ix_l) as u32).saturating_mul(target_scale);
             let dst_h = ((iy_b - iy_t) as u32).saturating_mul(target_scale);
-            if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
-                continue;
-            }
-            for y in 0..dst_h {
-                let sy = src_y + ((y as u64 * src_h as u64) / dst_h as u64) as u32;
-                let src_row_off = (sy as usize) * (frame.stride as usize);
-                let dst_row_off = ((dst_y + y) as usize) * (canvas_stride as usize)
-                    + (dst_x as usize) * 4;
-                for x in 0..dst_w {
-                    let sx = src_x + ((x as u64 * src_w as u64) / dst_w as u64) as u32;
-                    let src_off = src_row_off + (sx as usize) * 4;
-                    let dst_off = dst_row_off + (x as usize) * 4;
-                    if src_off + 4 <= frame.pixels.len()
-                        && dst_off + 4 <= canvas.len()
-                    {
-                        canvas[dst_off..dst_off + 4]
-                            .copy_from_slice(&frame.pixels[src_off..src_off + 4]);
-                    }
-                }
-            }
+            parts.push(pipeline::record::RegionPart {
+                output_name: info.name.clone(),
+                src_crop: CropRect {
+                    x: src_x as i32,
+                    y: src_y as i32,
+                    w: src_w,
+                    h: src_h,
+                },
+                dst_pos: (dst_x, dst_y),
+                dst_size: (dst_w, dst_h),
+            });
         }
-        Some(CapturedFrame {
-            pixels: canvas,
-            width: canvas_w,
-            height: canvas_h,
-            stride: canvas_stride,
+        if parts.is_empty() {
+            return None;
+        }
+        Some(RegionLayout {
+            canvas_w,
+            canvas_h,
+            target_scale,
+            parts,
         })
     }
 
@@ -2144,6 +2247,62 @@ impl Panel {
                 Mode::Record => {
                     if !self.can_start() {
                         return Task::none();
+                    }
+                    // Cross-screen region recording branches before the
+                    // single-output (target, crop) match below: we don't
+                    // have a single ScreencopyTarget — we have N, one per
+                    // overlapping output, composited on the GPU via
+                    // `record_via_screencopy_multi`. GIF on cross-screen
+                    // isn't supported (animated GIF assembly is sysmem-
+                    // path only); we abort cleanly in that combo.
+                    if matches!(self.source, Source::Region)
+                        && self.region_output_count() >= 2
+                    {
+                        let Some(layout) = self.compute_region_parts() else {
+                            tracing::warn!(
+                                "cross-screen region: compute_region_parts returned None"
+                            );
+                            return Task::none();
+                        };
+                        if matches!(self.record_format, RecordFormat::Gif) {
+                            tracing::warn!(
+                                "GIF doesn't support cross-screen region recording; \
+                                 aborting"
+                            );
+                            return Task::none();
+                        }
+                        // Pin the stop pill to the first overlapping
+                        // output — predictable and visible. (Same UX
+                        // trade-off as single-output: pill lands in the
+                        // recording.)
+                        self.recording_target_output =
+                            layout.parts.first().map(|p| p.output_name.clone());
+                        let close_bars = self.close_toolbars();
+                        let stop_pill = self.open_stop_pill();
+                        let swap = self.open_recording_overlays();
+                        let release_kb = Task::none();
+                        let helper = self.helper.clone();
+                        let args = self.build_record_args();
+                        let (stop_tx, stop_rx) = oneshot::channel();
+                        self.capture = CaptureState::Recording {
+                            stop_tx: Some(stop_tx),
+                        };
+                        self.recording_started_at = Some(std::time::Instant::now());
+                        return Task::batch([
+                            close_bars,
+                            stop_pill,
+                            swap,
+                            release_kb,
+                            Task::perform(
+                                run_record_screencopy_multi(
+                                    helper,
+                                    layout.parts,
+                                    args,
+                                    stop_rx,
+                                ),
+                                |r| cosmic::action::app(Msg::RecordingFinished(r)),
+                            ),
+                        ]);
                     }
                     // Pick the target monitor + optional crop. For Region,
                     // crop_from_region already lands on the output whose
@@ -3047,6 +3206,18 @@ async fn run_record_screencopy(
     stop_rx: oneshot::Receiver<()>,
 ) -> Result<String, String> {
     pipeline::record::record_via_screencopy(helper, target, args, crop, stop_rx)
+        .await
+        .map(path_to_string)
+        .map_err(|e| format!("{:#}", e))
+}
+
+async fn run_record_screencopy_multi(
+    helper: WaylandHelper,
+    parts: Vec<pipeline::record::RegionPart>,
+    args: RecordArgs,
+    stop_rx: oneshot::Receiver<()>,
+) -> Result<String, String> {
+    pipeline::record::record_via_screencopy_multi(helper, parts, args, stop_rx)
         .await
         .map(path_to_string)
         .map_err(|e| format!("{:#}", e))

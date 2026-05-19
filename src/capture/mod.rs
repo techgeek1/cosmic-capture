@@ -8,6 +8,8 @@
 //!   One-shot frame capture for the screenshot pipeline (no portal,
 //!   no second process, no temp file).
 
+pub mod dmabuf;
+pub mod dmabuf_stream;
 pub mod pipewire_capture;
 pub mod screencast;
 pub mod screencopy;

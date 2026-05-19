@@ -34,6 +34,94 @@ pub enum Command {
     /// clipboard. Not intended for direct use.
     #[command(name = "__clipboard_serve", hide = true)]
     ClipboardServe(ClipboardServeArgs),
+
+    /// Verify the dmabuf-backed screencopy path: capture one frame from
+    /// the named output via cosmic-screencopy + GBM, map the resulting
+    /// buffer object on the CPU side, and write it out as a PNG. Used
+    /// during dmabuf-pipeline bring-up to confirm cosmic-comp is actually
+    /// writing into the buffer we hand it.
+    #[command(name = "debug-dmabuf")]
+    DebugDmabuf(DebugDmabufArgs),
+
+    /// End-to-end dmabuf → gst → png verification. Captures one frame
+    /// into a GBM buffer, hands its fd to a gst pipeline
+    /// (`appsrc ! vapostproc ! pngenc ! filesink`), and confirms the
+    /// resulting PNG matches what the dmabuf-only debug path produces.
+    /// This is the gate before wiring dmabuf into the real recording
+    /// pipeline — it isolates "does cosmic-comp write into my BO?" from
+    /// "does gst correctly import that BO?".
+    #[command(name = "debug-dmabuf-gst")]
+    DebugDmabufGst(DebugDmabufArgs),
+
+    /// Continuous dmabuf recording: captures `--output` for
+    /// `--duration` seconds through the full
+    /// `dmabuf_stream → vapostproc → vah264enc → mp4mux → filesink`
+    /// chain. Validates the zero-copy pipeline end-to-end before the
+    /// production record path is rewired onto it.
+    #[command(name = "debug-dmabuf-record")]
+    DebugDmabufRecord(DebugDmabufRecordArgs),
+
+    /// Cross-screen region recording via vacompositor. Captures every
+    /// output that overlaps `--region` (logical coords) into its own
+    /// dmabuf stream, crops each to its intersection with the region
+    /// on the GPU, composites into one canvas via `vacompositor`, and
+    /// encodes the result. Zero CPU touch on pixels.
+    #[command(name = "debug-dmabuf-record-multi")]
+    DebugDmabufRecordMulti(DebugDmabufRecordMultiArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DebugDmabufRecordMultiArgs {
+    /// Region in logical pixels as `X,Y,W,H` (same coordinate space the
+    /// GUI region selector uses). All outputs whose logical rectangle
+    /// intersects this region will be recorded into the composite.
+    #[arg(long)]
+    pub region: String,
+    /// Destination mp4 path. Defaults to `./dmabuf-record-multi.mp4`.
+    #[arg(long, short = 'f')]
+    pub file: Option<PathBuf>,
+    /// Recording duration in seconds.
+    #[arg(long, default_value_t = 5)]
+    pub duration: u64,
+    /// Capture framerate.
+    #[arg(long, default_value_t = 30)]
+    pub fps: u32,
+    /// Include the cursor.
+    #[arg(long, default_value_t = false)]
+    pub cursor: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DebugDmabufRecordArgs {
+    /// Wayland output name (e.g. "DP-1").
+    #[arg(long)]
+    pub output: String,
+    /// Destination mp4 path. Defaults to `./dmabuf-record-<output>.mp4`.
+    #[arg(long, short = 'f')]
+    pub file: Option<PathBuf>,
+    /// Recording duration in seconds.
+    #[arg(long, default_value_t = 5)]
+    pub duration: u64,
+    /// Capture framerate.
+    #[arg(long, default_value_t = 30)]
+    pub fps: u32,
+    /// Include the cursor.
+    #[arg(long, default_value_t = false)]
+    pub cursor: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DebugDmabufArgs {
+    /// Wayland output name (e.g. "DP-1"). Use `wlr-randr` or
+    /// `swaymsg -t get_outputs` to list available outputs.
+    #[arg(long)]
+    pub output: String,
+    /// Destination PNG path. Defaults to `./dmabuf-debug-<output>.png`.
+    #[arg(long, short = 'f')]
+    pub file: Option<PathBuf>,
+    /// Include the cursor in the capture.
+    #[arg(long, default_value_t = false)]
+    pub cursor: bool,
 }
 
 #[derive(Debug, Args)]
