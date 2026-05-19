@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Unified screenshot, video, and GIF capture for the COSMIC desktop"
-license = "GPL-3.0-or-later"
+license = "MIT"
 repository = "https://github.com/techgeek1/cosmic-capture"
 
 [[bin]]

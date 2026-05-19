@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=COSMIC Capture
+GenericName=Screen Capture
+Comment=Capture screenshots, videos, and GIFs on the COSMIC desktop
+Exec=cosmic-capture
+Icon=camera-photo-symbolic
+Terminal=false
+Categories=Graphics;Utility;
+Keywords=screenshot;screencast;recorder;capture;video;gif;
+StartupNotify=true
