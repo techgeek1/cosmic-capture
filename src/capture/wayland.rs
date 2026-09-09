@@ -20,6 +20,10 @@ use std::thread;
 use anyhow::{Context, Result};
 use tokio::sync::Notify;
 use cosmic_client_toolkit::{
+    cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_handle_v1::{
+        self, ZcosmicToplevelHandleV1,
+    },
+    cosmic_protocols::toplevel_info::v1::client::zcosmic_toplevel_info_v1::ZcosmicToplevelInfoV1,
     cosmic_protocols::toplevel_management::v1::client::zcosmic_toplevel_manager_v1,
     screencopy::{
         CaptureFrame, CaptureOptions, CaptureSession, CaptureSource, Capturer, FailureReason,
@@ -101,6 +105,22 @@ struct WaylandHelperInner {
     /// wait_for_toplevel_info()` before snapshotting.
     info_done: AtomicBool,
     info_done_notify: Notify,
+    /// The toplevel cosmic-comp reported as `Activated` in the very
+    /// first batch of handle events, plus the first output it entered.
+    /// Latched once and never updated: cosmic-comp recomputes
+    /// `Activated` from the focus stack of the seat's *focused output*,
+    /// and the moment one of our Exclusive layer surfaces maps, that
+    /// output becomes ours — so anything read later (including sctk's
+    /// post-`done` `ToplevelInfo`) reports whichever window happens to
+    /// be on top under our last-mapped toolbar, not the window the
+    /// user was in. The raw events land ~45ms after bind, well before
+    /// our first toolbar can map (it waits on a screencopy).
+    first_activated: Mutex<Option<(ZcosmicToplevelHandleV1, Option<wl_output::WlOutput>)>>,
+    /// First `output_enter` seen per cosmic toplevel handle, so a
+    /// `state` event that arrives after its `output_enter` can still be
+    /// resolved. Only populated until `first_activated` is latched.
+    handle_outputs: Mutex<HashMap<ZcosmicToplevelHandleV1, wl_output::WlOutput>>,
+    first_activated_notify: Notify,
     /// `wl_seat` handles for `activate_toplevel`. cosmic-comp's
     /// toplevel-management `activate` request takes both a toplevel and a
     /// seat (it scopes the focus change to the seat that asked). We track
@@ -339,6 +359,9 @@ impl WaylandHelper {
                 toplevels: Mutex::new(Vec::new()),
                 info_done: AtomicBool::new(false),
                 info_done_notify: Notify::new(),
+                first_activated: Mutex::new(None),
+                handle_outputs: Mutex::new(HashMap::new()),
+                first_activated_notify: Notify::new(),
                 seats: Mutex::new(Vec::new()),
                 toplevel_manager: Mutex::new(None),
                 gbm_registry: Arc::new(GbmRegistry::new()),
@@ -420,6 +443,73 @@ impl WaylandHelper {
             std::time::Duration::from_millis(500),
             notified,
         )
+        .await;
+    }
+
+    /// Name of the output showing the currently *activated* (keyboard
+    /// focused) toplevel, per cosmic-toplevel-info. `None` if nothing is
+    /// focused, the info protocol is too old to carry state/output, or
+    /// the initial batch hasn't landed yet (see `wait_for_toplevel_info`).
+    pub fn activated_toplevel_output(&self) -> Option<String> {
+        use zcosmic_toplevel_handle_v1::State;
+        // Preferred: the latched pre-map snapshot (see `first_activated`).
+        if let Some((handle, output)) = self.inner.first_activated.lock().unwrap().clone() {
+            let name = output.as_ref().and_then(|o| {
+                self.inner.output_infos.lock().unwrap().get(o).and_then(|i| i.name.clone())
+            });
+            tracing::debug!(handle = ?wayland_client::Proxy::id(&handle), ?name, "activated toplevel at bind time");
+            if name.is_some() {
+                return name;
+            }
+        }
+        // Fallback (older compositors without the early burst): sctk's
+        // post-`done` view, which may already be polluted by our own
+        // surfaces — better than nothing.
+        let toplevels = self.inner.toplevels.lock().unwrap();
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for t in toplevels.iter().filter(|t| t.state.contains(&State::Activated)) {
+                let outs: Vec<String> = {
+                    let infos = self.inner.output_infos.lock().unwrap();
+                    t.output.iter().filter_map(|o| infos.get(o).and_then(|i| i.name.clone())).collect()
+                };
+                tracing::debug!(title = %t.title, app_id = %t.app_id, ?outs, "activated toplevel");
+            }
+        }
+        let active = toplevels
+            .iter()
+            .find(|t| t.state.contains(&State::Activated))?;
+        let output = active.output.iter().next()?.clone();
+        drop(toplevels);
+        self.inner
+            .output_infos
+            .lock()
+            .unwrap()
+            .get(&output)
+            .and_then(|info| info.name.clone())
+    }
+
+    /// Wait until the pre-map `Activated` snapshot is latched, or the
+    /// initial toplevel-info batch is `done` (whichever first), capped
+    /// at 300ms. Returns immediately if either already happened.
+    pub async fn wait_for_activated_toplevel(&self) {
+        let ready = || {
+            self.inner.info_done.load(Ordering::Acquire)
+                || self.inner.first_activated.lock().unwrap().is_some()
+        };
+        if ready() {
+            return;
+        }
+        let notified = self.inner.first_activated_notify.notified();
+        let done = self.inner.info_done_notify.notified();
+        if ready() {
+            return;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            tokio::select! {
+                _ = notified => {},
+                _ = done => {},
+            }
+        })
         .await;
     }
 
@@ -1059,6 +1149,7 @@ impl ScreencopyHandler for AppData {
                 width: data.width,
                 height: data.height,
                 stride: data.stride,
+                shm_fd: Some(Arc::new(fd)),
             };
             if let Some(tx) = data.sender.lock().unwrap().take() {
                 let _ = tx.send(Ok(captured));
@@ -1207,7 +1298,85 @@ smithay_client_toolkit::delegate_registry!(AppData);
 smithay_client_toolkit::delegate_seat!(AppData);
 smithay_client_toolkit::delegate_shm!(AppData);
 cosmic_client_toolkit::delegate_screencopy!(AppData);
-cosmic_client_toolkit::delegate_toplevel_info!(AppData);
+// Expanded form of `cosmic_client_toolkit::delegate_toplevel_info!(AppData)`,
+// with the `zcosmic_toplevel_handle_v1` arm written out so we can peek
+// at `state` / `output_enter` before sctk folds them into its pending
+// info (which is only published on `done`, ~300ms later on cosmic-comp).
+use cosmic_client_toolkit::GlobalData as CctkGlobalData;
+wayland_client::delegate_dispatch!(AppData: [ZcosmicToplevelInfoV1: CctkGlobalData] => ToplevelInfoState);
+wayland_client::delegate_dispatch!(AppData: [
+    wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1: CctkGlobalData
+] => ToplevelInfoState);
+wayland_client::delegate_dispatch!(AppData: [
+    ExtForeignToplevelHandleV1: cosmic_client_toolkit::toplevel_info::ToplevelUserData
+] => ToplevelInfoState);
+
+impl wayland_client::Dispatch<ZcosmicToplevelHandleV1, CctkGlobalData> for AppData {
+    fn event(
+        state: &mut Self,
+        proxy: &ZcosmicToplevelHandleV1,
+        event: zcosmic_toplevel_handle_v1::Event,
+        data: &CctkGlobalData,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        state.note_activated(proxy, &event);
+        <ToplevelInfoState as wayland_client::Dispatch<ZcosmicToplevelHandleV1, CctkGlobalData, Self>>::event(
+            state, proxy, event, data, conn, qh,
+        );
+    }
+
+    fn event_created_child(
+        opcode: u16,
+        qh: &QueueHandle<Self>,
+    ) -> std::sync::Arc<dyn wayland_client::backend::ObjectData> {
+        <ToplevelInfoState as wayland_client::Dispatch<ZcosmicToplevelHandleV1, CctkGlobalData, Self>>::event_created_child(
+            opcode, qh,
+        )
+    }
+}
+
+impl AppData {
+    /// Latch the first `Activated` toplevel and its output (see
+    /// `Inner::first_activated`).
+    fn note_activated(&self, handle: &ZcosmicToplevelHandleV1, event: &zcosmic_toplevel_handle_v1::Event) {
+        use zcosmic_toplevel_handle_v1::{Event, State};
+        let inner = &self.helper.inner;
+        let mut first = inner.first_activated.lock().unwrap();
+        match event {
+            Event::OutputEnter { output } => {
+                match first.as_mut() {
+                    Some((h, slot)) if h == handle => {
+                        if slot.is_none() {
+                            *slot = Some(output.clone());
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        inner
+                            .handle_outputs
+                            .lock()
+                            .unwrap()
+                            .entry(handle.clone())
+                            .or_insert_with(|| output.clone());
+                    }
+                }
+            }
+            Event::State { state } if first.is_none() => {
+                let activated = state
+                    .chunks_exact(4)
+                    .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                    .any(|v| v == State::Activated as u32);
+                if activated {
+                    let output = inner.handle_outputs.lock().unwrap().remove(handle);
+                    *first = Some((handle.clone(), output));
+                    inner.first_activated_notify.notify_waiters();
+                }
+            }
+            _ => {}
+        }
+    }
+}
 cosmic_client_toolkit::delegate_toplevel_manager!(AppData);
 cosmic_client_toolkit::delegate_workspace!(AppData);
 delegate_noop!(AppData: ignore wl_buffer::WlBuffer);
@@ -1216,7 +1385,7 @@ delegate_noop!(AppData: ignore wl_shm_pool::WlShmPool);
 /// Create a memfd large enough to back an `Abgr8888` buffer of `size`
 /// bytes. Direct port of `xdg-desktop-portal-cosmic`'s
 /// `buffer::create_memfd`, simplified for our single-format path.
-fn create_memfd(size: usize) -> Option<OwnedFd> {
+pub(crate) fn create_memfd(size: usize) -> Option<OwnedFd> {
     let name = c"cosmic-capture-screencopy";
     let fd = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC)
         .map_err(|e| tracing::warn!(error = %e, "memfd_create failed"))

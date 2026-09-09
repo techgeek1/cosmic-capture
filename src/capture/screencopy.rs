@@ -36,6 +36,11 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
+    /// The memfd the compositor wrote this frame into, when the capture
+    /// went through `wl_shm`. Lets the GUI attach the very same bytes
+    /// to a subsurface (`Abgr8888`, `stride`, offset 0) instead of
+    /// uploading `pixels` as a texture.
+    pub shm_fd: Option<Arc<std::os::fd::OwnedFd>>,
 }
 
 impl std::fmt::Debug for CapturedFrame {
@@ -246,6 +251,7 @@ impl ScreencopyHandler for AppData {
             width: fd.width,
             height: fd.height,
             stride: fd.stride,
+            shm_fd: None,
         }));
     }
 

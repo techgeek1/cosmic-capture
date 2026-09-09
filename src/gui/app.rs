@@ -15,7 +15,7 @@
 //!    selector ids render the rectangle selector for the matching output.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -26,6 +26,9 @@ use cosmic::iced::keyboard::Key;
 use cosmic::iced::keyboard::key::Named;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     Anchor, KeyboardInteractivity, Layer, destroy_layer_surface, get_layer_surface,
+};
+use cosmic::iced::platform_specific::shell::wayland::subsurface_widget::{
+    BufferSource, Shmbuf, Subsurface, SubsurfaceBuffer,
 };
 use cosmic::iced::runtime::platform_specific::wayland::layer_surface::{
     IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
@@ -61,8 +64,72 @@ const TOOLBAR_BOTTOM_MARGIN: u16 = 32;
 /// are avoided by the matching `DND_MIME` filter on incoming events.
 const SELECTION_DND_ID: u128 = 0x4341_5054_5552_452D_5345_4C45_4354_494F;
 
+/// Single-instance guard. Holds an advisory `flock` on a file under
+/// `$XDG_RUNTIME_DIR` for the life of the process; a second launch
+/// (e.g. the user mashing the capture hotkey while the toolbar is up)
+/// sees the lock held and exits instead of opening a second set of
+/// overlays on top of the first. The kernel drops the lock when the
+/// process exits, however it exits, so a crash can't wedge future
+/// launches. The `File` is opened `O_CLOEXEC` (Rust's default), so the
+/// re-exec'd `__clipboard_serve` child never inherits the lock.
+struct InstanceLock {
+    _file: std::fs::File,
+}
+
+impl InstanceLock {
+    fn try_acquire() -> Result<Option<Self>> {
+        use anyhow::Context as _;
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let path = dir.join("cosmic-capture.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open instance lock {}", path.display()))?;
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("flock {}: {e}", path.display())),
+        }
+    }
+}
+
+/// Every icon the toolbar can show, for `init`'s lookup prewarm.
+const TOOLBAR_ICONS: &[&str] = &[
+    "camera-photo-symbolic",
+    "camera-video-symbolic",
+    "screenshot-selection-symbolic",
+    "screenshot-screen-symbolic",
+    "screenshot-window-symbolic",
+    "audio-input-microphone-symbolic",
+    "audio-speakers-symbolic",
+    "window-close-symbolic",
+];
+
 pub fn launch() -> Result<()> {
+    let _lock = match InstanceLock::try_acquire()? {
+        Some(lock) => lock,
+        None => {
+            tracing::info!("another cosmic-capture instance is already running; exiting");
+            return Ok(());
+        }
+    };
     tracing::info!("cosmic-capture GUI starting (layer-shell toolbar)");
+    // iced builds its font database lazily on the render thread, at
+    // the first toolbar's first frame: it mmaps and parses every
+    // system font (~20ms warm, ~600ms on a cold page cache). Kick it
+    // off now so it overlaps wgpu init and the freeze captures instead
+    // of sitting on the first frame's critical path.
+    std::thread::Builder::new()
+        .name("font-db-warm".into())
+        .spawn(|| {
+            let _ = cosmic::iced::advanced::graphics::text::font_system();
+        })
+        .ok();
     let settings = Settings::default()
         .no_main_window(true)
         .exit_on_close(false)
@@ -213,7 +280,20 @@ struct OutputInfo {
     name: String,
     logical_pos: (i32, i32),
     logical_size: (u32, u32),
-    scale: i32,
+    /// Size of the output's current mode in physical pixels, already
+    /// swapped for 90°/270° transforms so it lines up with
+    /// `logical_size`. This — not `wl_output.scale` — is what screencopy
+    /// buffers are sized to. `wl_output.scale` is an integer, so a
+    /// laptop panel at 125%/150% reports `2` while its buffer is only
+    /// 1.25×/1.5× the logical size; every crop computed from the
+    /// integer lands off-target and oversized.
+    physical_size: (u32, u32),
+    /// Whether the freeze capture for this output has completed (in
+    /// either direction). The toolbar surface is only mapped once this
+    /// is set so the frozen frame never contains our own overlay, and
+    /// so the compositor doesn't yank keyboard focus (dismissing any
+    /// open panel popup) before we've captured what's on screen.
+    freeze_done: bool,
     /// Per-output toolbar layer surface (the pill + selection canvas).
     /// One per output so users can capture from whichever monitor they like.
     toolbar_id: Option<window::Id>,
@@ -236,24 +316,115 @@ struct OutputInfo {
     /// doesn't evict the entry between renders.
     #[allow(dead_code)]
     frozen_alloc: Option<cosmic::iced::runtime::image::Allocation>,
+    /// Zero-copy alternative to `frozen_handle`: the freeze's own shm
+    /// memfd wrapped for libcosmic's subsurface widget. The view
+    /// prefers this when present — the compositor samples the buffer
+    /// directly, so we never pay the 15–24MB-per-output texture
+    /// upload on the render thread that `frozen_handle` costs.
+    frozen_sub: Option<SubsurfaceBuffer>,
     /// Output's wallpaper config — pulled from `cosmic_bg_config::state`
     /// on output discovery. Window-mode picker paints this as its
     /// background (path → image, color → solid/gradient) so the
     /// foreground toplevel tiles aren't competing with their own
     /// reflections in a frozen output capture.
     bg_source: Option<cosmic_bg_config::Source>,
-    /// Iced image-cache pin for the wallpaper handle. Filled
-    /// asynchronously on output discovery (`image::allocate` runs
-    /// concurrently with the rest of the init tasks); holding the
-    /// `Allocation` keeps the wgpu cache entry's strong_count > 0 so
-    /// the first picker entry doesn't pay a texture upload at the
-    /// moment the wallpaper layer enters the tree — which manifests as
-    /// a one-frame "stale freeze bg flash" where the unpopulated
-    /// wallpaper rect lets the frozen image behind it show through.
-    /// `None` for solid-color / gradient bg sources (no texture to
-    /// upload).
-    #[allow(dead_code)]
-    wallpaper_alloc: Option<cosmic::iced::runtime::image::Allocation>,
+    /// Decoded wallpaper for `Source::Path` bg sources, cover-scaled
+    /// to this output and written into a memfd for the subsurface
+    /// widget — the same zero-upload path as `frozen_sub`. Decoded on
+    /// a blocking thread (see `spawn_wallpaper_decode`).
+    ///
+    /// Not an iced image handle on purpose: `Handle::from_path`
+    /// decodes a 5K JPEG synchronously in the renderer's first
+    /// `prepare`, and `image::allocate` only pins the texture in
+    /// whichever window iced's window manager lists first (per-window
+    /// image caches), so gating the picker on it waited on a texture
+    /// the picker's own window never had.
+    wallpaper_sub: Option<SubsurfaceBuffer>,
+}
+
+impl OutputInfo {
+    /// Physical-per-logical pixel ratio along each axis. Fractional on
+    /// scaled outputs (1.25, 1.5, …); exactly 1.0 at 100%.
+    fn scale_xy(&self) -> (f64, f64) {
+        let (lw, lh) = self.logical_size;
+        let (pw, ph) = self.physical_size;
+        let sx = if lw > 0 { pw as f64 / lw as f64 } else { 1.0 };
+        let sy = if lh > 0 { ph as f64 / lh as f64 } else { 1.0 };
+        (sx.max(f64::EPSILON), sy.max(f64::EPSILON))
+    }
+
+    /// Crop, in this output's physical pixels, of the part of `region`
+    /// (global logical coords) that falls on this output. `None` if the
+    /// intersection is empty.
+    fn crop_for_region(&self, region: SelectionRect) -> Option<CropRect> {
+        crop_for_region(output_rect_of(self), self.physical_size, region)
+    }
+}
+
+/// Map the part of `region` (global logical coords) that falls inside
+/// `out` (an output's global logical rect) onto that output's physical
+/// pixel grid of size `physical`. Fractional scales are handled by
+/// taking the real physical/logical ratio per axis. `None` if the
+/// intersection is empty.
+fn crop_for_region(
+    out: SelectionRect,
+    physical: (u32, u32),
+    region: SelectionRect,
+) -> Option<CropRect> {
+    let l = region.left.max(out.left);
+    let t = region.top.max(out.top);
+    let r = region.right.min(out.right);
+    let b = region.bottom.min(out.bottom);
+    if r <= l || b <= t {
+        return None;
+    }
+    let (lw, lh) = (out.width(), out.height());
+    let (pw, ph) = physical;
+    let sx = if lw > 0 { pw as f64 / lw as f64 } else { 1.0 };
+    let sy = if lh > 0 { ph as f64 / lh as f64 } else { 1.0 };
+    // Round each edge independently rather than rounding an origin
+    // and a size — otherwise a 1.5× output accumulates a one-pixel
+    // seam between adjacent parts of a cross-screen region.
+    let px_l = ((((l - out.left) as f64) * sx).round() as i64).clamp(0, pw as i64);
+    let px_t = ((((t - out.top) as f64) * sy).round() as i64).clamp(0, ph as i64);
+    let px_r = ((((r - out.left) as f64) * sx).round() as i64).clamp(px_l, pw as i64);
+    let px_b = ((((b - out.top) as f64) * sy).round() as i64).clamp(px_t, ph as i64);
+    Some(CropRect {
+        x: px_l as i32,
+        y: px_t as i32,
+        w: (px_r - px_l).max(1) as u32,
+        h: (px_b - px_t).max(1) as u32,
+    })
+}
+
+/// Physical pixel size of an output's current mode, oriented to match
+/// its logical size (i.e. swapped for 90°/270° transforms). Falls back
+/// to `logical × scale_factor` when no current mode has been reported
+/// yet, which is at least right for integer scales.
+fn physical_size_of(info: &cosmic::cctk::sctk::output::OutputInfo) -> (u32, u32) {
+    use wayland_client::protocol::wl_output::Transform;
+    let mode = info
+        .modes
+        .iter()
+        .find(|m| m.current)
+        .map(|m| (m.dimensions.0.max(0) as u32, m.dimensions.1.max(0) as u32));
+    match mode {
+        Some((w, h)) if w > 0 && h > 0 => {
+            let rotated = matches!(
+                info.transform,
+                Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270
+            );
+            if rotated { (h, w) } else { (w, h) }
+        }
+        _ => {
+            let s = info.scale_factor.max(1) as u32;
+            let (w, h) = info
+                .logical_size
+                .map(|(w, h)| (w.max(0) as u32, h.max(0) as u32))
+                .unwrap_or((0, 0));
+            (w.saturating_mul(s), h.saturating_mul(s))
+        }
+    }
 }
 
 pub struct Panel {
@@ -372,6 +543,16 @@ pub struct Panel {
     /// through a global mutex and still hung when one toplevel was
     /// unresponsive).
     helper: WaylandHelper,
+    /// Output showing the toplevel that had keyboard focus when we
+    /// launched. `None` = not known yet; `Some(None)` = nothing focused
+    /// (or the compositor can't tell us). Drives toolbar map/destroy
+    /// ordering — see `map_ready_toolbars` for why.
+    focus_output: Option<Option<String>>,
+    /// Invisible 1x1 `Exclusive` overlay surface on `focus_output`,
+    /// mapped after the toolbars so it is what the compositor considers
+    /// focused, and destroyed last so focus is restored from the right
+    /// output. See `ensure_focus_catcher`.
+    focus_catcher_id: Option<window::Id>,
 }
 
 #[derive(Clone, Debug)]
@@ -430,7 +611,7 @@ pub struct WindowEntry {
 struct RegionLayout {
     canvas_w: u32,
     canvas_h: u32,
-    target_scale: u32,
+    target_scale: f64,
     parts: Vec<pipeline::record::RegionPart>,
 }
 
@@ -480,16 +661,10 @@ pub enum Msg {
     /// failures.
     FrozenFrameReady(u32, Option<Arc<CapturedFrame>>),
     /// `image::allocate` completed for a freshly-captured freeze. The
-    /// handle is now pinned in iced's wgpu image cache, so swapping it
-    /// into `info.frozen_handle` won't pay a first-frame upload — the
-    /// old handle keeps rendering until this lands, giving a stale →
-    /// new swap rather than an empty → new flash.
-    FrozenAllocated(
-        u32,
-        Arc<CapturedFrame>,
-        cosmic::iced::widget::image::Handle,
-        Option<cosmic::iced::runtime::image::Allocation>,
-    ),
+    /// handle is already installed in `info.frozen_handle` (see
+    /// `FrozenFrameReady`); this just stores the pin so iced's trim
+    /// pass can't evict the texture between renders.
+    FrozenAllocated(u32, Option<cosmic::iced::runtime::image::Allocation>),
     /// Per-output toplevel thumbnails arrived as a batch. Carries the
     /// output name (matched against `OutputInfo.name`) and the captured
     /// entries in stream order. Replaces the previous per-window
@@ -509,16 +684,16 @@ pub enum Msg {
     /// picker leaves the widget tree (Region/Screen mode) and reupload
     /// on the next Window toggle.
     ThumbAllocated(String, usize, Option<cosmic::iced::runtime::image::Allocation>),
-    /// `iced::widget::image::allocate` result for an output's
-    /// wallpaper handle. Pre-uploading the texture before the picker
-    /// layer enters the widget tree prevents a one-frame race where
-    /// the empty wallpaper rect lets the frozen bg behind it show
-    /// through — the "stale background frame flash" the user sees on
-    /// first picker entry per output.
-    WallpaperAllocated(u32, Option<cosmic::iced::runtime::image::Allocation>),
+    /// Background wallpaper decode finished for some outputs. `None`
+    /// means the file couldn't be decoded (or the memfd failed); the
+    /// picker then falls back to the frozen capture as its backdrop.
+    WallpaperDecoded(Vec<(u32, Option<SubsurfaceBuffer>)>),
     /// User clicked a window card → capture that window full-res and save.
     CaptureToplevel(String),
     Quit,
+    /// cosmic-toplevel-info told us which output held the focused
+    /// window at launch (see `Panel::focus_output`).
+    FocusOutputKnown(Option<String>),
 }
 
 impl Application for Panel {
@@ -543,6 +718,22 @@ impl Application for Panel {
         // take ~10s — the helper's dispatch thread was running but iced's
         // own wayland connection was still cold, so capture events stalled
         // until iced caught up.
+        // Resolve the toolbar's icon names to paths off the main
+        // thread. The first `icon::from_name(..).path()` per name walks
+        // the icon-theme directories (a stat storm that otherwise lands
+        // inside the first `view()`); the result goes into
+        // freedesktop-icons' global cache, keyed by (theme, name, size,
+        // scale), which the view's un-sized lookups then hit. Done here
+        // rather than in `launch` so libcosmic has already applied the
+        // user's icon theme.
+        std::thread::Builder::new()
+            .name("icon-warm".into())
+            .spawn(|| {
+                for name in TOOLBAR_ICONS {
+                    let _ = icon::from_name(*name).path();
+                }
+            })
+            .ok();
         let wayland_conn = wayland_client::Connection::connect_to_env()
             .expect("connect wayland");
         let helper = WaylandHelper::new(wayland_conn)
@@ -578,6 +769,8 @@ impl Application for Panel {
             streaming_sessions: HashMap::new(),
             helper,
             dummy_id,
+            focus_output: None,
+            focus_catcher_id: None,
         };
 
         // Direct port of `CosmicPortal::init` in
@@ -603,7 +796,19 @@ impl Application for Panel {
             size_limits: Limits::NONE,
         });
 
-        (panel, dummy)
+        // Which output holds the focused window? Feeds
+        // `ensure_focus_catcher`. Read from the first burst of
+        // toplevel-info events (~45ms), before any of our surfaces can
+        // take focus and move `Activated` elsewhere.
+        let helper = panel.helper.clone();
+        let focus_lookup = Task::perform(
+            async move {
+                helper.wait_for_activated_toplevel().await;
+                helper.activated_toplevel_output()
+            },
+            |name| cosmic::action::app(Msg::FocusOutputKnown(name)),
+        );
+        (panel, Task::batch([dummy, focus_lookup]))
     }
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
@@ -689,7 +894,11 @@ impl Application for Panel {
                         // back to Region/Screen. The freeze captured
                         // at `Output::Created` (before any overlay was
                         // painted) is the clean version; keep it.
-                        return self.force_refresh_window_picker();
+                        let keys: Vec<u32> = self.outputs.keys().copied().collect();
+                        return Task::batch([
+                            self.spawn_wallpaper_decode(&keys),
+                            self.force_refresh_window_picker(),
+                        ]);
                     } else {
                         // Leaving Window source — stop all streaming
                         // sessions so we're not paying screencopy
@@ -745,7 +954,15 @@ impl Application for Panel {
                             .logical_size
                             .map(|(w, h)| (w as u32, h as u32))
                             .unwrap_or((0, 0));
-                        let scale = info.scale_factor;
+                        let physical_size = physical_size_of(&info);
+                        tracing::info!(
+                            output = %name,
+                            ?logical_pos,
+                            ?logical_size,
+                            ?physical_size,
+                            wl_scale = info.scale_factor,
+                            "output registered"
+                        );
                         let name_for_capture = name.clone();
                         let bg_source = load_bg_for_output(&name);
                         self.outputs.insert(
@@ -755,14 +972,16 @@ impl Application for Panel {
                                 name,
                                 logical_pos,
                                 logical_size,
-                                scale,
+                                physical_size,
+                                freeze_done: false,
                                 toolbar_id: None,
                                 recording_id: None,
                                 frozen: None,
                                 frozen_handle: None,
+                                frozen_sub: None,
                                 frozen_alloc: None,
                                 bg_source,
-                                wallpaper_alloc: None,
+                                wallpaper_sub: None,
                             },
                         );
                         // Don't `prune_stale_region` here: outputs arrive
@@ -775,20 +994,27 @@ impl Application for Panel {
                         // registered. If the monitor is truly gone, the
                         // region just sits invisibly until the user
                         // drags a new one.
-                        // Open the toolbar. Freeze capture only fires in
-                        // Screenshot mode — Record needs the live screen
-                        // visible so the user can frame the action they're
-                        // about to record.
-                        let open = self.ensure_toolbar_for(key);
                         let with_cursor = self.rec_cursor;
-                        let mut tasks = vec![open];
-                        // Freeze background — captured unconditionally
-                        // so a later Mode::Screenshot entry doesn't pay
-                        // a visible "transparent until freeze lands"
-                        // gap. The view only paints this in Screenshot
-                        // mode (gated on `self.mode` at render time),
-                        // so Record users never see it; we just hold it
-                        // in memory for the eventual mode swap.
+                        let mut tasks: Vec<Task<Msg>> = Vec::new();
+                        // Freeze background *before* the toolbar maps.
+                        // The toolbar is opened from `FrozenAllocated`
+                        // (or `FrozenFrameReady(None)`), never here —
+                        // same ordering as xdg-desktop-portal-cosmic,
+                        // which captures every output and only then
+                        // creates its layer surfaces. Issuing both in
+                        // one batch raced: the toolbar is an
+                        // `Exclusive`-keyboard overlay, so the
+                        // compositor moves focus to it the moment it
+                        // maps, which dismisses any open panel popup —
+                        // and whether the freeze caught the popup (or
+                        // our own toolbar) depended on which request
+                        // the compositor serviced first.
+                        //
+                        // Captured unconditionally, not just in
+                        // Screenshot mode, so a later Mode::Screenshot
+                        // entry doesn't pay a visible "transparent until
+                        // freeze lands" gap. The view only paints it in
+                        // Screenshot mode.
                         {
                             let helper = self.helper.clone();
                             let name_for_freeze = name_for_capture.clone();
@@ -813,35 +1039,22 @@ impl Application for Panel {
                             let picker_name = name_for_capture.clone();
                             tasks.push(self.spawn_picker_capture(picker_name, with_cursor));
                         }
-                        // Pre-allocate the wallpaper texture so the
-                        // first picker entry doesn't pay a per-frame
-                        // upload at the moment the wallpaper layer
-                        // enters the tree. Only meaningful for
-                        // path-backed wallpapers — solid/gradient
-                        // sources don't go through an image cache.
-                        if let Some(cosmic_bg_config::Source::Path(path)) =
-                            self.outputs.get(&key).and_then(|o| o.bg_source.clone())
-                        {
-                            let handle =
-                                cosmic::iced::widget::image::Handle::from_path(path);
-                            tasks.push(
-                                cosmic::iced::runtime::image::allocate(handle)
-                                    .map(move |r: Result<_, _>| {
-                                        cosmic::action::app(Msg::WallpaperAllocated(
-                                            key,
-                                            r.ok(),
-                                        ))
-                                    }),
-                            );
-                        }
-                        if tasks.len() == 1 {
-                            return tasks.pop().unwrap();
+                        // The wallpaper is only ever painted by the
+                        // Window picker, so don't touch it unless
+                        // that's the source we're launching into;
+                        // `SetSource(Window)` decodes it lazily
+                        // otherwise. Decoding it eagerly for every
+                        // output was ~100ms of JPEG decode + a 59MB
+                        // texture upload per output at launch.
+                        if matches!(self.source, Source::Window) {
+                            tasks.push(self.spawn_wallpaper_decode(&[key]));
                         }
                         return Task::batch(tasks);
                     }
                     OutputEvent::Created(None) => {}
                     OutputEvent::InfoUpdate(info) => {
                         if let Some(o) = self.outputs.get_mut(&key) {
+                            o.physical_size = physical_size_of(&info);
                             if let Some(n) = info.name {
                                 o.name = n;
                             }
@@ -851,11 +1064,15 @@ impl Application for Panel {
                             if let Some((w, h)) = info.logical_size {
                                 o.logical_size = (w as u32, h as u32);
                             }
-                            o.scale = info.scale_factor;
                         }
                         // If we'd missed opening a toolbar (e.g. the Created
-                        // event arrived without geometry), retry now.
-                        return self.ensure_toolbar_for(key);
+                        // event arrived without geometry), retry now — but
+                        // only once the freeze has landed; before that the
+                        // deferred open in `FrozenAllocated` is still
+                        // pending and must stay ordered after the capture.
+                        if self.outputs.get(&key).is_some_and(|o| o.freeze_done) {
+                            return self.map_ready_toolbars();
+                        }
                     }
                     OutputEvent::Removed => {
                         if let Some(info) = self.outputs.remove(&key) {
@@ -1131,6 +1348,7 @@ impl Application for Panel {
                 return Task::batch(all);
             }
             Msg::PickerPainted(output_name) => {
+                tracing::debug!(output = %output_name, "picker painted");
                 self.picker_painted.insert(output_name);
             }
             Msg::ThumbAllocated(output_name, idx, alloc) => {
@@ -1140,9 +1358,18 @@ impl Application for Panel {
                     }
                 }
             }
-            Msg::WallpaperAllocated(key, alloc) => {
-                if let Some(info) = self.outputs.get_mut(&key) {
-                    info.wallpaper_alloc = alloc;
+            Msg::WallpaperDecoded(results) => {
+                for (key, sub) in results {
+                    let Some(info) = self.outputs.get_mut(&key) else {
+                        continue;
+                    };
+                    let Some(sub) = sub else {
+                        tracing::warn!(output = %info.name, "wallpaper decode failed; picker uses freeze bg");
+                        info.bg_source = None;
+                        continue;
+                    };
+                    tracing::debug!(output = %info.name, "wallpaper ready");
+                    info.wallpaper_sub = Some(sub);
                 }
             }
             Msg::CaptureToplevel(identifier) => {
@@ -1256,7 +1483,7 @@ impl Application for Panel {
             }
 
             Msg::FrozenFrameReady(key, result) => {
-                if self.outputs.get(&key).is_none() {
+                if !self.outputs.contains_key(&key) {
                     return Task::none();
                 }
                 let Some(frame) = result else {
@@ -1264,33 +1491,47 @@ impl Application for Panel {
                         key,
                         "freeze capture returned None; toolbar will run live-screen"
                     );
-                    return Task::none();
+                    if let Some(o) = self.outputs.get_mut(&key) {
+                        o.freeze_done = true;
+                    }
+                    return self.map_ready_toolbars();
                 };
-                // Build the handle but don't swap it into OutputInfo
-                // yet — pre-allocate first so the swap is texture-ready
-                // on the very next frame. Without this, the old handle
-                // gets replaced atomically but the new one's wgpu cache
-                // entry doesn't exist yet, producing a one-frame empty
-                // rect that lets whatever's underneath flash through
-                // (the "stale background flash" the user sees on
-                // Record→Screenshot transitions where freezes refresh).
-                let handle = frame_to_image_handle(&frame);
-                let handle_for_msg = handle.clone();
-                return cosmic::iced::runtime::image::allocate(handle.clone()).map(
+                // Install the freeze *now* and map the toolbar in the
+                // same batch (it must not open any earlier — see
+                // `Output::Created`). Preferred path: hand the
+                // compositor the screencopy memfd itself through a
+                // subsurface, so the first frame shows the frozen
+                // desktop with no texture upload at all.
+                if let Some(sub) = frozen_subsurface_buffer(&frame) {
+                    if let Some(info) = self.outputs.get_mut(&key) {
+                        info.frozen = Some(frame);
+                        info.frozen_sub = Some(sub);
+                        info.freeze_done = true;
+                    }
+                    return self.map_ready_toolbars();
+                }
+                // No shm fd (or dup failed): fall back to a texture. The
+                // toolbar's first `prepare` uploads it synchronously, so
+                // its first frame still shows the freeze. We kick
+                // `image::allocate` to pin the wgpu cache entry, but
+                // can't *wait* on it before opening the toolbar:
+                // allocation only completes during a window redraw, and
+                // with no toolbar mapped there is nothing to redraw.
+                let handle = shared_frame_to_image_handle(&frame);
+                let pin = cosmic::iced::runtime::image::allocate(handle.clone()).map(
                     move |r: Result<_, _>| {
-                        cosmic::action::app(Msg::FrozenAllocated(
-                            key,
-                            frame.clone(),
-                            handle_for_msg.clone(),
-                            r.ok(),
-                        ))
+                        cosmic::action::app(Msg::FrozenAllocated(key, r.ok()))
                     },
                 );
-            }
-            Msg::FrozenAllocated(key, frame, handle, alloc) => {
                 if let Some(info) = self.outputs.get_mut(&key) {
                     info.frozen = Some(frame);
                     info.frozen_handle = Some(handle);
+                    info.freeze_done = true;
+                }
+                return Task::batch([self.map_ready_toolbars(), pin]);
+            }
+            Msg::FrozenAllocated(key, alloc) => {
+                if let Some(info) = self.outputs.get_mut(&key) {
                     info.frozen_alloc = alloc;
                 }
             }
@@ -1316,6 +1557,11 @@ impl Application for Panel {
             Msg::Quit => {
                 return self.shutdown();
             }
+            Msg::FocusOutputKnown(name) => {
+                tracing::info!(output = ?name, "focused toplevel's output at launch");
+                self.focus_output = Some(name);
+                return self.map_ready_toolbars();
+            }
         }
         Task::none()
     }
@@ -1333,7 +1579,7 @@ impl Application for Panel {
         // Dummy warm-up surface from init() — invisible 6x6 placeholder.
         // Returns empty space matching xdg-desktop-portal-cosmic's
         // `view_window` branch for its dummy_id.
-        if id == self.dummy_id {
+        if id == self.dummy_id || Some(id) == self.focus_catcher_id {
             return iced::widget::Space::new()
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1548,6 +1794,45 @@ impl Panel {
     /// entries the cached thumbnails are stale by design — the user is
     /// asking us to show them what each window looks like *now*, not
     /// what it looked like when the toolbar first opened.
+    /// Decode (and cover-scale) the path wallpapers of `keys` on a
+    /// blocking thread. Outputs sharing a file share one decode — the
+    /// common case is the same wallpaper on every display, and a 5K
+    /// JPEG is ~100ms to decode. Skips color/gradient sources and
+    /// outputs whose handle is already built.
+    fn spawn_wallpaper_decode(&self, keys: &[u32]) -> Task<Msg> {
+        let mut by_path: HashMap<PathBuf, Vec<(u32, (u32, u32))>> = HashMap::new();
+        for &key in keys {
+            let Some(info) = self.outputs.get(&key) else {
+                continue;
+            };
+            if info.wallpaper_sub.is_some() {
+                continue;
+            }
+            let Some(cosmic_bg_config::Source::Path(path)) = info.bg_source.clone() else {
+                continue;
+            };
+            by_path.entry(path).or_default().push((key, info.physical_size));
+        }
+        if by_path.is_empty() {
+            return Task::none();
+        }
+        let tasks: Vec<Task<Msg>> = by_path
+            .into_iter()
+            .map(|(path, targets)| {
+                Task::perform(
+                    async move {
+                        let keys: Vec<u32> = targets.iter().map(|&(k, _)| k).collect();
+                        tokio::task::spawn_blocking(move || decode_wallpaper(&path, &targets))
+                            .await
+                            .unwrap_or_else(|_| keys.into_iter().map(|k| (k, None)).collect())
+                    },
+                    |results| cosmic::action::app(Msg::WallpaperDecoded(results)),
+                )
+            })
+            .collect();
+        Task::batch(tasks)
+    }
+
     fn force_refresh_window_picker(&mut self) -> Task<Msg> {
         let with_cursor = self.rec_cursor;
         let mut tasks: Vec<Task<Msg>> = Vec::new();
@@ -1695,6 +1980,101 @@ impl Panel {
     /// overlays receive key events without bouncing focus to apps below.
     /// Multiple Exclusive layer surfaces are allowed by wlr-layer-shell —
     /// cosmic-comp routes focus to whichever surface the pointer is over.
+    /// Map every toolbar whose freeze is done, then (once we know it)
+    /// the focus catcher on the focused window's output.
+    fn map_ready_toolbars(&mut self) -> Task<Msg> {
+        // Hold until the pre-map `Activated` snapshot is latched (or
+        // its wait expires — `FocusOutputKnown` always arrives): an
+        // Exclusive toolbar mapping first would move `Activated` to a
+        // window on *its* output and poison the snapshot. The latch
+        // usually beats the freeze captures; worst case it adds the
+        // remainder of the 300ms cap.
+        if self.focus_output.is_none() {
+            return Task::none();
+        }
+        let mut tasks: Vec<Task<Msg>> = Vec::new();
+        let keys: Vec<u32> = self.outputs.keys().copied().collect();
+        for key in keys {
+            let info = &self.outputs[&key];
+            if info.freeze_done && info.toolbar_id.is_none() {
+                tasks.push(self.ensure_toolbar_for(key));
+            }
+        }
+        // The catcher must be the *last* Exclusive surface to map. If
+        // a toolbar mapped after it (late freeze, hotplug), tear the
+        // catcher down and re-create it behind the new toolbars.
+        if !tasks.is_empty() {
+            if let Some(old) = self.focus_catcher_id.take() {
+                tasks.push(destroy_layer_surface(old));
+            }
+        }
+        // Chained, not batched: ordering on the wire is the point.
+        Task::batch(tasks).chain(self.ensure_focus_catcher())
+    }
+
+    /// Focus restoration on exit is decided by cosmic-comp like this:
+    /// an `Exclusive` layer surface takes keyboard focus the moment it
+    /// maps, and the seat's "focused output" becomes that surface's
+    /// output. When the focused surface is destroyed, focus goes to the
+    /// top of the focus stack of *that* output. Our toolbars map in
+    /// freeze-completion order, so the output that happened to finish
+    /// last decided where focus went on quit — usually not the output
+    /// the user's window was on, which looks like focus never coming
+    /// back. Waiting for toplevel-info before mapping anything would
+    /// fix the order but costs ~300ms (cosmic-comp sends the initial
+    /// `done` late), so instead: once we know the focused window's
+    /// output, map an invisible 1x1 `Exclusive` surface there. It
+    /// becomes the focused surface; `destroy_toolbars_ordered` tears it
+    /// down last. Key handling is per-app, not per-surface, so the
+    /// toolbar hotkeys don't care which of our surfaces has focus.
+    fn ensure_focus_catcher(&mut self) -> Task<Msg> {
+        if self.focus_catcher_id.is_some() {
+            return Task::none();
+        }
+        // Only once every output's toolbar is up — a toolbar mapping
+        // later would take focus away from the catcher.
+        if self.outputs.is_empty() || !self.outputs.values().all(|o| o.toolbar_id.is_some()) {
+            return Task::none();
+        }
+        let Some(Some(name)) = self.focus_output.as_ref() else {
+            return Task::none();
+        };
+        let Some(info) = self.outputs.values().find(|o| o.name == *name) else {
+            return Task::none();
+        };
+        let id = window::Id::unique();
+        self.focus_catcher_id = Some(id);
+        get_layer_surface(SctkLayerSurfaceSettings {
+            id,
+            layer: Layer::Overlay,
+            keyboard_interactivity: KeyboardInteractivity::Exclusive,
+            input_zone: Some(Vec::new()),
+            anchor: Anchor::empty(),
+            output: IcedOutput::Output(info.output.clone()),
+            namespace: "cosmic-capture-focus".to_string(),
+            size: Some((Some(1), Some(1))),
+            exclusive_zone: -1,
+            size_limits: Limits::NONE.min_height(1.0).min_width(1.0),
+            margin: IcedMargin::default(),
+        })
+    }
+
+    /// Destroy all toolbars, then the focus catcher (see
+    /// `ensure_focus_catcher`). Chained so the requests hit the wire in
+    /// that order.
+    fn destroy_toolbars_ordered(&mut self) -> Task<Msg> {
+        let mut tasks: Vec<Task<Msg>> = Vec::new();
+        for info in self.outputs.values_mut() {
+            if let Some(id) = info.toolbar_id.take() {
+                tasks.push(destroy_layer_surface(id));
+            }
+        }
+        match self.focus_catcher_id.take() {
+            Some(id) => Task::batch(tasks).chain(destroy_layer_surface(id)),
+            None => Task::batch(tasks),
+        }
+    }
+
     fn ensure_toolbar_for(&mut self, key: u32) -> Task<Msg> {
         let Some(info) = self.outputs.get_mut(&key) else {
             return Task::none();
@@ -1757,13 +2137,7 @@ impl Panel {
     /// starts so cursor motion across the (no-longer-needed) pills can't
     /// trigger hover-state redraws — that's the flicker.
     fn close_toolbars(&mut self) -> Task<Msg> {
-        let mut tasks: Vec<Task<Msg>> = Vec::new();
-        for info in self.outputs.values_mut() {
-            if let Some(id) = info.toolbar_id.take() {
-                tasks.push(destroy_layer_surface(id));
-            }
-        }
-        Task::batch(tasks)
+        self.destroy_toolbars_ordered()
     }
 
     /// Open a compact "recording in progress" pill at the bottom-center of
@@ -1833,13 +2207,11 @@ impl Panel {
             tasks.push(destroy_layer_surface(id));
         }
         for info in self.outputs.values_mut() {
-            if let Some(id) = info.toolbar_id.take() {
-                tasks.push(destroy_layer_surface(id));
-            }
             if let Some(id) = info.recording_id.take() {
                 tasks.push(destroy_layer_surface(id));
             }
         }
+        tasks.push(self.destroy_toolbars_ordered());
         tasks.push(iced::exit());
         Task::batch(tasks)
     }
@@ -1943,6 +2315,7 @@ impl Panel {
             width: canvas_w,
             height: canvas_h,
             stride: canvas_stride,
+            shm_fd: None,
         })
     }
 
@@ -1979,47 +2352,48 @@ impl Panel {
         if overlapping.is_empty() {
             return None;
         }
+        // Canvas density = the densest overlapping output, measured as
+        // a real physical/logical ratio (fractional scales included) so
+        // that output's pixels land 1:1 and lower-density outputs get
+        // upscaled rather than the reverse.
         let target_scale = overlapping
             .iter()
-            .map(|o| o.scale.max(1) as u32)
-            .max()
-            .unwrap_or(1);
-        let canvas_w = (region.width() as u32).saturating_mul(target_scale);
-        let canvas_h = (region.height() as u32).saturating_mul(target_scale);
+            .map(|o| {
+                let (sx, sy) = o.scale_xy();
+                sx.max(sy)
+            })
+            .fold(1.0_f64, f64::max);
+        let to_canvas = |logical: i32| -> i64 { ((logical as f64) * target_scale).round() as i64 };
+        let canvas_w = (to_canvas(region.right) - to_canvas(region.left)).max(0) as u32;
+        let canvas_h = (to_canvas(region.bottom) - to_canvas(region.top)).max(0) as u32;
         if canvas_w == 0 || canvas_h == 0 {
             return None;
         }
         let mut parts: Vec<pipeline::record::RegionPart> = Vec::with_capacity(overlapping.len());
         for info in overlapping {
-            let out_left = info.logical_pos.0;
-            let out_top = info.logical_pos.1;
-            let out_right = out_left + info.logical_size.0 as i32;
-            let out_bottom = out_top + info.logical_size.1 as i32;
-            let ix_l = region.left.max(out_left);
-            let iy_t = region.top.max(out_top);
-            let ix_r = region.right.min(out_right);
-            let iy_b = region.bottom.min(out_bottom);
-            if ix_r <= ix_l || iy_b <= iy_t {
+            let out = output_rect_of(info);
+            let ix_l = region.left.max(out.left);
+            let iy_t = region.top.max(out.top);
+            let ix_r = region.right.min(out.right);
+            let iy_b = region.bottom.min(out.bottom);
+            let Some(src_crop) = info.crop_for_region(region) else {
+                continue;
+            };
+            // Destination edges are rounded independently (same as the
+            // source crop) so neighbouring parts tile without a seam.
+            let dst_l = (to_canvas(ix_l) - to_canvas(region.left)).clamp(0, canvas_w as i64);
+            let dst_t = (to_canvas(iy_t) - to_canvas(region.top)).clamp(0, canvas_h as i64);
+            let dst_r = (to_canvas(ix_r) - to_canvas(region.left)).clamp(dst_l, canvas_w as i64);
+            let dst_b = (to_canvas(iy_b) - to_canvas(region.top)).clamp(dst_t, canvas_h as i64);
+            let dst_w = (dst_r - dst_l) as u32;
+            let dst_h = (dst_b - dst_t) as u32;
+            if dst_w == 0 || dst_h == 0 {
                 continue;
             }
-            let src_scale = info.scale.max(1) as u32;
-            let src_x = ((ix_l - out_left).max(0) as u32).saturating_mul(src_scale);
-            let src_y = ((iy_t - out_top).max(0) as u32).saturating_mul(src_scale);
-            let src_w = ((ix_r - ix_l) as u32).saturating_mul(src_scale);
-            let src_h = ((iy_b - iy_t) as u32).saturating_mul(src_scale);
-            let dst_x = ((ix_l - region.left) as u32).saturating_mul(target_scale);
-            let dst_y = ((iy_t - region.top) as u32).saturating_mul(target_scale);
-            let dst_w = ((ix_r - ix_l) as u32).saturating_mul(target_scale);
-            let dst_h = ((iy_b - iy_t) as u32).saturating_mul(target_scale);
             parts.push(pipeline::record::RegionPart {
                 output_name: info.name.clone(),
-                src_crop: CropRect {
-                    x: src_x as i32,
-                    y: src_y as i32,
-                    w: src_w,
-                    h: src_h,
-                },
-                dst_pos: (dst_x, dst_y),
+                src_crop,
+                dst_pos: (dst_l as u32, dst_t as u32),
                 dst_size: (dst_w, dst_h),
             });
         }
@@ -2071,26 +2445,11 @@ impl Panel {
         let cx = (region.left + region.right) / 2;
         let cy = (region.top + region.bottom) / 2;
         let info = self.outputs.values().find(|o| {
-            let r_left = o.logical_pos.0;
-            let r_top = o.logical_pos.1;
-            let r_right = r_left + o.logical_size.0 as i32;
-            let r_bottom = r_top + o.logical_size.1 as i32;
-            cx >= r_left && cx < r_right && cy >= r_top && cy < r_bottom
+            let r = output_rect_of(o);
+            cx >= r.left && cx < r.right && cy >= r.top && cy < r.bottom
         })?;
-        let scale = info.scale.max(1);
-        let lx = (region.left - info.logical_pos.0).max(0);
-        let ly = (region.top - info.logical_pos.1).max(0);
-        let lw = region.width().min(info.logical_size.0 as i32 - lx).max(1);
-        let lh = region.height().min(info.logical_size.1 as i32 - ly).max(1);
-        Some((
-            info.name.clone(),
-            CropRect {
-                x: lx * scale,
-                y: ly * scale,
-                w: (lw * scale) as u32,
-                h: (lh * scale) as u32,
-            },
-        ))
+        let crop = info.crop_for_region(region)?;
+        Some((info.name.clone(), crop))
     }
 
     /// Compute the crop that excludes the on-screen recording border
@@ -2102,9 +2461,7 @@ impl Panel {
     /// doesn't include it when capturing a Toplevel.
     fn screen_border_crop(&self, output_name: &str) -> Option<CropRect> {
         let info = self.outputs.values().find(|o| o.name == output_name)?;
-        let scale = info.scale.max(1) as u32;
-        let phys_w = info.logical_size.0.saturating_mul(scale);
-        let phys_h = info.logical_size.1.saturating_mul(scale);
+        let (phys_w, phys_h) = info.physical_size;
         let inset = SCREEN_CAPTURE_BORDER_INSET;
         if phys_w <= inset * 2 || phys_h <= inset * 2 {
             return None;
@@ -2118,27 +2475,7 @@ impl Panel {
     }
 
     fn crop_from_region(&self) -> Option<CropRect> {
-        let region = self.region?.normalize();
-        let cx = (region.left + region.right) / 2;
-        let cy = (region.top + region.bottom) / 2;
-        let info = self.outputs.values().find(|o| {
-            let r_left = o.logical_pos.0;
-            let r_top = o.logical_pos.1;
-            let r_right = r_left + o.logical_size.0 as i32;
-            let r_bottom = r_top + o.logical_size.1 as i32;
-            cx >= r_left && cx < r_right && cy >= r_top && cy < r_bottom
-        })?;
-        let scale = info.scale.max(1);
-        let lx = (region.left - info.logical_pos.0).max(0);
-        let ly = (region.top - info.logical_pos.1).max(0);
-        let lw = region.width().min(info.logical_size.0 as i32 - lx).max(1);
-        let lh = region.height().min(info.logical_size.1 as i32 - ly).max(1);
-        Some(CropRect {
-            x: lx * scale,
-            y: ly * scale,
-            w: (lw * scale) as u32,
-            h: (lh * scale) as u32,
-        })
+        self.region_output_and_crop().map(|(_, crop)| crop)
     }
 
     /// Translate the current `save_target` into a screenshot pipeline
@@ -2513,13 +2850,16 @@ impl Panel {
 
         let source = info.bg_source.as_ref()?;
         let element: Element<'_, Msg> = match source {
-            Source::Path(path) => cosmic::iced::widget::image(
-                cosmic::iced::widget::image::Handle::from_path(path),
-            )
-            .content_fit(cosmic::iced::ContentFit::Cover)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
+            // Already cover-scaled to the output in `decode_wallpaper`,
+            // so `Fill` is exact. Sits below the toolbar surface like
+            // the freeze; the tiles draw in the parent above it.
+            Source::Path(_) => Element::new(
+                Subsurface::new(info.wallpaper_sub.clone()?)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(cosmic::iced::ContentFit::Fill)
+                    .z(-1),
+            ),
             Source::Color(color) => {
                 let color = color.clone();
                 container(iced::widget::Space::new())
@@ -2867,18 +3207,14 @@ impl Panel {
         //   * `picker_painted` — set ~100ms after `WindowsForOutputReady`
         //     so the `IntrinsicShader` wgpu pipeline is warm and tile
         //     textures are uploaded into `ThumbPipeline`.
-        //   * `wallpaper_alloc` — `image::allocate` finished for this
-        //     output's wallpaper, so the bg image is pinned in iced's
-        //     atlas and won't race on first sample.
-        // For non-Window sources both checks are bypassed; the frozen
-        // bg has its own readiness gate (`frozen_alloc`).
-        // For path wallpapers we need `image::allocate` to land before
-        // the bg is texture-ready. Color / gradient sources go through
-        // a `container` widget with no texture upload, so they're
-        // always ready; same for outputs with no wallpaper at all
-        // (cosmic-bg not running).
+        //   * `wallpaper_sub` — the decoded wallpaper memfd exists, so
+        //     the compositor can show it the same frame the tiles land.
+        // For non-Window sources both checks are bypassed. Color /
+        // gradient sources go through a `container` widget with no
+        // texture upload, so they're always ready; same for outputs
+        // with no wallpaper at all (cosmic-bg not running).
         let wallpaper_ready = match info.bg_source.as_ref() {
-            Some(cosmic_bg_config::Source::Path(_)) => info.wallpaper_alloc.is_some(),
+            Some(cosmic_bg_config::Source::Path(_)) => info.wallpaper_sub.is_some(),
             _ => true,
         };
         let tiles_ready = !matches!(self.source, Source::Window)
@@ -2897,7 +3233,21 @@ impl Panel {
             && matches!(self.mode, Mode::Screenshot)
             && !matches!(self.source, Source::Window)
         {
-            if let Some(handle) = info.frozen_handle.as_ref() {
+            if let Some(sub) = info.frozen_sub.as_ref() {
+                // z < 0 stacks the subsurface *below* the toolbar
+                // surface; the toolbar is transparent wherever it
+                // doesn't paint, so the freeze shows through.
+                // `From<Subsurface>` is only implemented for
+                // `Element<'static>`; go through `Element::new`.
+                let freeze: Element<'_, Msg> = Element::new(
+                    Subsurface::new(sub.clone())
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(cosmic::iced::ContentFit::Fill)
+                        .z(-1),
+                );
+                stack = stack.push(freeze);
+            } else if let Some(handle) = info.frozen_handle.as_ref() {
                 stack = stack.push(
                     cosmic::iced::widget::image(handle.clone())
                         .width(Length::Fill)
@@ -2933,18 +3283,16 @@ impl Panel {
             // Only paint the "you'll capture this monitor" border on the
             // display the pointer is currently on. Without this every output
             // shows a border simultaneously, which defeats the purpose.
-            // Fallback: if hover hasn't been established yet (initial frame
-            // before any pointer event), highlight the first output so the
-            // affordance isn't completely missing.
-            let is_hovered = self
-                .hovered_toolbar
-                .map(|h| Some(h) == info.toolbar_id)
-                .unwrap_or_else(|| {
-                    self.outputs
-                        .values()
-                        .find(|o| o.toolbar_id.is_some())
-                        .map_or(false, |o| o.toolbar_id == info.toolbar_id)
-                });
+            //
+            // No fallback before the first pointer event: toolbars map
+            // one output at a time, and guessing "the first output with
+            // a toolbar" meant the border appeared on whichever output
+            // came up first, then jumped to the real one when the
+            // compositor's pointer enter landed a few ms later — a
+            // visible flash on every launch. The enter arrives within a
+            // frame of the surface mapping, so waiting for it costs
+            // nothing perceptible.
+            let is_hovered = self.hovered_toolbar.is_some_and(|h| Some(h) == info.toolbar_id);
             if is_hovered {
                 stack = stack.push(fullscreen_border());
             }
@@ -3365,21 +3713,137 @@ async fn capture_toplevels_for_output(
 /// image handle. The handle internally stores an `Arc<Bytes>`, so it's
 /// cheap to clone for every redraw.
 fn frame_to_image_handle(frame: &CapturedFrame) -> cosmic::iced::widget::image::Handle {
+    cosmic::iced::widget::image::Handle::from_rgba(frame.width, frame.height, packed_rows(frame))
+}
+
+/// Wrap a freeze's memfd as a subsurface buffer. `None` if the frame
+/// didn't come through shm or the fd couldn't be dup'd.
+fn frozen_subsurface_buffer(frame: &Arc<CapturedFrame>) -> Option<SubsurfaceBuffer> {
+    let fd = match frame.shm_fd.as_ref()?.try_clone() {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::warn!(error = %e, "dup freeze memfd failed; uploading as texture");
+            return None;
+        }
+    };
+    let (buffer, _release) = SubsurfaceBuffer::new(Arc::new(BufferSource::Shm(Shmbuf {
+        fd,
+        offset: 0,
+        width: frame.width as i32,
+        height: frame.height as i32,
+        stride: frame.stride as i32,
+        format: cosmic::cctk::wayland_client::protocol::wl_shm::Format::Abgr8888,
+    })));
+    Some(buffer)
+}
+
+/// Same as `frame_to_image_handle` but shares the pixel buffer with the
+/// `Arc<CapturedFrame>` when the rows are already tightly packed, so a
+/// 24MB freeze isn't memcpy'd (and page-faulted) again on the main
+/// thread just to hand it to iced.
+fn shared_frame_to_image_handle(
+    frame: &Arc<CapturedFrame>,
+) -> cosmic::iced::widget::image::Handle {
+    struct Pixels(Arc<CapturedFrame>);
+    impl AsRef<[u8]> for Pixels {
+        fn as_ref(&self) -> &[u8] {
+            &self.0.pixels
+        }
+    }
+    let bytes = if frame.stride as usize == frame.width as usize * 4 {
+        cosmic::iced::core::Bytes::from_owner(Pixels(frame.clone()))
+    } else {
+        cosmic::iced::core::Bytes::from(packed_rows(frame))
+    };
+    cosmic::iced::widget::image::Handle::from_rgba(frame.width, frame.height, bytes)
+}
+
+/// Copy `frame` into a tightly packed `width * 4` row layout.
+fn packed_rows(frame: &CapturedFrame) -> Vec<u8> {
     let w = frame.width as usize;
     let h = frame.height as usize;
     let s = frame.stride as usize;
     let row_bytes = w * 4;
-    let buf = if s == row_bytes {
-        frame.pixels.clone()
-    } else {
-        let mut out = Vec::with_capacity(row_bytes * h);
-        for y in 0..h {
-            let off = y * s;
-            out.extend_from_slice(&frame.pixels[off..off + row_bytes]);
+    if s == row_bytes {
+        return frame.pixels.clone();
+    }
+    let mut out = Vec::with_capacity(row_bytes * h);
+    for y in 0..h {
+        let off = y * s;
+        out.extend_from_slice(&frame.pixels[off..off + row_bytes]);
+    }
+    out
+}
+
+/// Decode a wallpaper file and scale it to cover `target` (output
+/// physical size), matching the picker's `ContentFit::Cover`. Scaling
+/// here keeps the uploaded texture at output size instead of the
+/// source's (a 5K wallpaper is 59MB as RGBA8).
+fn decode_wallpaper(
+    path: &Path,
+    targets: &[(u32, (u32, u32))],
+) -> Vec<(u32, Option<SubsurfaceBuffer>)> {
+    let started = std::time::Instant::now();
+    let img = match image::open(path) {
+        Ok(img) => img.into_rgba8(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "wallpaper decode failed");
+            return targets.iter().map(|&(k, _)| (k, None)).collect();
         }
-        out
     };
-    cosmic::iced::widget::image::Handle::from_rgba(frame.width, frame.height, buf)
+    let decode_ms = started.elapsed().as_millis();
+    let (iw, ih) = img.dimensions();
+    targets
+        .iter()
+        .map(|&(key, (tw, th))| {
+            let rgba = if tw > 0 && th > 0 && (iw > tw || ih > th) {
+                let scale = (f64::from(tw) / f64::from(iw)).max(f64::from(th) / f64::from(ih));
+                let w = (f64::from(iw) * scale).round().max(1.0) as u32;
+                let h = (f64::from(ih) * scale).round().max(1.0) as u32;
+                // Box-filter downscale: ~4x faster than `resize` with
+                // Triangle and indistinguishable for a backdrop.
+                image::imageops::thumbnail(&img, w, h)
+            } else {
+                img.clone()
+            };
+            let (w, h) = rgba.dimensions();
+            tracing::debug!(
+                path = %path.display(), w, h, decode_ms,
+                total_ms = started.elapsed().as_millis(),
+                "wallpaper decoded"
+            );
+            (key, rgba_to_shm_buffer(w, h, rgba.as_raw()))
+        })
+        .collect()
+}
+
+/// Copy tightly packed RGBA8 pixels into a fresh memfd and wrap it as
+/// an `Abgr8888` shm subsurface buffer (little-endian ABGR is the
+/// R,G,B,A byte order in memory).
+fn rgba_to_shm_buffer(width: u32, height: u32, rgba: &[u8]) -> Option<SubsurfaceBuffer> {
+    let stride = width as usize * 4;
+    let size = stride * height as usize;
+    if rgba.len() < size || size == 0 {
+        return None;
+    }
+    let fd = crate::capture::wayland::create_memfd(size)?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::from(fd.try_clone().ok()?);
+        if let Err(e) = file.write_all(&rgba[..size]) {
+            tracing::warn!(error = %e, "wallpaper memfd write failed");
+            return None;
+        }
+    }
+    let (buffer, _release) = SubsurfaceBuffer::new(Arc::new(BufferSource::Shm(Shmbuf {
+        fd,
+        offset: 0,
+        width: width as i32,
+        height: height as i32,
+        stride: stride as i32,
+        format: cosmic::cctk::wayland_client::protocol::wl_shm::Format::Abgr8888,
+    })));
+    Some(buffer)
 }
 
 
@@ -3440,3 +3904,48 @@ fn wayland_proxy_id(o: &WlOutput) -> u32 {
     use wayland_client::Proxy;
     o.id().protocol_id()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> SelectionRect {
+        SelectionRect { left, top, right, bottom }
+    }
+
+    #[test]
+    fn crop_at_100_percent_is_identity() {
+        let out = rect(2559, 0, 2559 + 3840, 1600);
+        let c = crop_for_region(out, (3840, 1600), rect(2600, 100, 2700, 250)).unwrap();
+        assert_eq!((c.x, c.y, c.w, c.h), (41, 100, 100, 150));
+    }
+
+    #[test]
+    fn crop_on_fractional_scale_uses_real_ratio() {
+        // 1920x1200 panel at 115%: logical 1670x1043. wl_output.scale
+        // would report 2 here; the crop must use 1920/1670 ≈ 1.15.
+        let out = rect(0, 0, 1670, 1043);
+        let c = crop_for_region(out, (1920, 1200), rect(0, 0, 1670, 1043)).unwrap();
+        assert_eq!((c.x, c.y, c.w, c.h), (0, 0, 1920, 1200));
+        let c = crop_for_region(out, (1920, 1200), rect(835, 0, 1670, 521)).unwrap();
+        assert_eq!((c.x, c.w), (960, 960));
+        assert_eq!((c.y, c.h), (0, 599));
+    }
+
+    #[test]
+    fn crop_clips_to_output_and_rejects_disjoint() {
+        let out = rect(0, 160, 2560, 1600);
+        let c = crop_for_region(out, (2560, 1440), rect(-50, 100, 100, 300)).unwrap();
+        assert_eq!((c.x, c.y, c.w, c.h), (0, 0, 100, 140));
+        assert!(crop_for_region(out, (2560, 1440), rect(3000, 0, 3100, 100)).is_none());
+    }
+
+    #[test]
+    fn adjacent_parts_on_fractional_output_tile_without_seam() {
+        let out = rect(0, 0, 1670, 1043);
+        let a = crop_for_region(out, (1920, 1200), rect(0, 0, 333, 100)).unwrap();
+        let b = crop_for_region(out, (1920, 1200), rect(333, 0, 666, 100)).unwrap();
+        assert_eq!(a.x + a.w as i32, b.x);
+    }
+}
+

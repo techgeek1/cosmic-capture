@@ -405,6 +405,7 @@ impl ScreencopyHandler for AppData {
             width: fd.width,
             height: fd.height,
             stride: fd.stride,
+            shm_fd: None,
         }));
     }
 

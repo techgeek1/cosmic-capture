@@ -1102,6 +1102,7 @@ dependencies = [
  "gstreamer-allocators",
  "gstreamer-app",
  "gstreamer-video",
+ "image",
  "imgref",
  "libcosmic",
  "libspa",
